@@ -1,0 +1,32 @@
+name: Bug report
+description: Something in the contracts or the example pusher does not behave as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Security issues: do not file them here. See SECURITY.md."
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Commands, a Daml Script, or the transaction and its error message.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Release tag or commit, Daml SDK version, and Canton/Splice version.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options: [oracle-price-store, oracle-chainlink, oracle-api, example pusher, docs, other]

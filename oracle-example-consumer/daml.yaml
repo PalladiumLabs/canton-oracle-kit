@@ -1,0 +1,14 @@
+# Example only, not for production. Shows how an application reads a price from the store inside
+# its own choice. Copy the pattern into your own package; do not deploy this one.
+name: oracle-example-consumer
+version: 1.0.0
+sdk-version: 3.4.11
+
+source: src
+dependencies:
+  - daml-prim
+  - daml-stdlib
+
+data-dependencies:
+  - ../oracle-api/.daml/dist/oracle-api-1.0.0.dar
+  - ../oracle-price-store/.daml/dist/oracle-price-store-1.0.0.dar

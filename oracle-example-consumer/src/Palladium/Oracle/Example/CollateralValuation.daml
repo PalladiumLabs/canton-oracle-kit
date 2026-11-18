@@ -1,0 +1,51 @@
+-- Copyright 2026 Sats Labs Inc. (d/b/a Palladium Labs)
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Example consumer: value a holding of an asset at the current oracle price.
+--
+-- The pattern every consumer follows:
+--
+--   * The consuming template is signed by the store's operator. `GetPrice` is `controller operator`,
+--     so only a transaction carrying the operator's authority can read a price. A template signed
+--     by the operator lends that authority to its choices.
+--   * The user who exercises the choice cannot see the store, because only the operator and the
+--     pusher are stakeholders on it. The application passes the store to the submission as an
+--     explicitly disclosed contract (see the test in `oracle-tests`).
+--   * The store's contract id changes on every push, so the choice takes the current id as an
+--     argument instead of storing it. The pusher's `current-store` helper returns it.
+--   * Because the id is an argument, the choice checks that the store it was given is signed by
+--     the same operator as the consuming template. Anyone can create a `PriceStore` naming
+--     themselves as operator, so an unchecked id lets the caller supply their own prices.
+module Palladium.Oracle.Example.CollateralValuation where
+
+import Palladium.Oracle.PriceStore (PriceStore, GetPrice(..), PriceData(..))
+
+-- | A holding of `quantity` units of the asset priced by `feed` (a label such as "BTC-USD", or a
+-- raw feed id).
+template Holding
+  with
+    operator : Party
+    owner : Party
+    feed : Text
+    quantity : Decimal
+  where
+    signatory operator
+    observer owner
+    ensure quantity >= 0.0
+
+    -- | Value the holding at the current price. Aborts if the price is missing or stale, so a
+    -- consumer never acts on a price older than the store's `maxStalenessSeconds`.
+    nonconsuming choice Value : Decimal
+      with
+        storeCid : ContractId PriceStore
+      controller owner
+      do
+        -- `storeCid` comes from the caller, so check it is this operator's store before reading.
+        -- `PriceStore` is signed by its operator alone: without this check the owner could create
+        -- a store of their own with any price in it, and `GetPrice` on that store would be
+        -- authorized by the owner's own authority as controller of this choice.
+        store <- fetch storeCid
+        assertMsg "The price store does not belong to this holding's operator"
+          (store.operator == operator)
+        pd <- exercise storeCid GetPrice with feedId = feed
+        pure (quantity * pd.price)

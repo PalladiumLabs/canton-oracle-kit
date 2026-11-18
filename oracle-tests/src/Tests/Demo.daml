@@ -1,0 +1,52 @@
+-- Copyright 2026 Sats Labs Inc. (d/b/a Palladium Labs)
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Local demo: the whole write path with Chainlink's signed test report, no credentials needed.
+--
+-- Runs on the in-memory ledger with `make demo`. It does what a real deployment does, in order:
+-- create the store and the feeder, validate the pinned verifier pair, register a label, push a
+-- signed report, and read the price back by label. The verifier config carries the real signer set
+-- of Chainlink's fixture report, so `Verify` performs genuine signature recovery.
+module Tests.Demo where
+
+import Daml.Script
+import DA.Time (time)
+import DA.Date (date, Month(..))
+import PayloadBuilder (createPayloadFromIndices, encodePayload)
+import Verifier (Verifier(..))
+import Palladium.Oracle.PriceStore qualified as PS
+import Palladium.Oracle.Chainlink (ChainlinkPriceFeeder(..), ValidateVerifier(..), PushVerifiedPrice(..))
+import Tests.OracleChainlink (mkOracle, mkRealCfg, sink, store, fixtureFeedId, assertEq)
+
+demo : Script ()
+demo = do
+  operator <- allocateParty "operator"
+  pusher   <- allocateParty "pusher"
+  chainlink <- allocateParty "chainlink-config-owner"
+
+  -- The fixture report is valid for 120 seconds in October 2025; run inside that window.
+  setTime (time (date 2025 Oct 13) 12 31 56)
+
+  -- 1. Chainlink's side, which exists on a real network already: a verifier and its config.
+  verifier <- submit chainlink $ createCmd Verifier with owner = chainlink, observers = [operator, pusher]
+  cfg <- mkRealCfg chainlink operator pusher 2
+
+  -- 2. The operator creates the store and the feeder, then validates the pinned pair.
+  store0 <- mkOracle operator pusher
+  feeder <- submit operator $ createCmd ChainlinkPriceFeeder with
+    operator, oraclePusher = pusher, verifierCid = verifier, verifierConfigCid = cfg
+    expectedConfigOwner = chainlink
+  submit operator $ exerciseCmd feeder ValidateVerifier
+  store1 <- submit operator $ exerciseCmd store0 PS.RegisterFeed with
+    label = "ETH-USD-TEST", rawFeedId = fixtureFeedId
+  debug "setup done: store, feeder, verifier validated, label ETH-USD-TEST registered"
+
+  -- 3. The pusher pushes the signed report. Verification and decoding happen on-ledger.
+  let signedReport = encodePayload (createPayloadFromIndices [0, 1, 2])
+  store2 <- store <$> submit pusher (exerciseCmd feeder PushVerifiedPrice with
+    sinkCid = sink store1, signedReportBytes = signedReport)
+
+  -- 4. Read the price back by label.
+  pd <- submit operator $ exerciseCmd store2 PS.GetPrice with feedId = "ETH-USD-TEST"
+  debug ("price on ledger: ETH-USD-TEST = " <> show pd.price <> " (observed at " <> show pd.observationsTimestamp <> ")")
+  assertEq "demo price" 3000.0 pd.price

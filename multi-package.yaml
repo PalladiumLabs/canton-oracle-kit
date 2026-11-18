@@ -1,0 +1,6 @@
+packages:
+  - ./oracle-api
+  - ./oracle-chainlink
+  - ./oracle-price-store
+  - ./oracle-example-consumer
+  - ./oracle-tests

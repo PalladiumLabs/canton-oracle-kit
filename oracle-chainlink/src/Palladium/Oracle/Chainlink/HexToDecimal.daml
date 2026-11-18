@@ -1,0 +1,59 @@
+-- Copyright 2026 Sats Labs Inc. (d/b/a Palladium Labs)
+-- SPDX-License-Identifier: Apache-2.0
+-- Portions adapted from Chainlink's Data Streams Canton examples.
+-- Copyright (c) 2018 SmartContract ChainLink Limited SEZC. Licensed under the MIT License; see THIRD_PARTY_NOTICES.md.
+
+-- | Convert hex strings to Decimal values.
+-- Adapted from the data-streams-canton examples (MIT; see THIRD_PARTY_NOTICES.md).
+module Palladium.Oracle.Chainlink.HexToDecimal where
+
+import DA.Text qualified as T
+
+-- | Convert unsigned hex to Decimal.
+-- Accepts both lower- and upper-case digits, and guards against overflowing
+-- Decimal (Numeric 10, max ~9.2e27) on very large words rather than silently wrapping.
+hexToUnsignedDecimal : Text -> Decimal
+hexToUnsignedDecimal hex =
+  let s = T.dropWhile (== "0") hex
+      hexVal : Text -> Decimal
+      hexVal c = case c of
+        "0" -> 0.0; "1" -> 1.0; "2" -> 2.0; "3" -> 3.0; "4" -> 4.0; "5" -> 5.0
+        "6" -> 6.0; "7" -> 7.0; "8" -> 8.0; "9" -> 9.0
+        "a" -> 10.0; "b" -> 11.0; "c" -> 12.0; "d" -> 13.0; "e" -> 14.0; "f" -> 15.0
+        "A" -> 10.0; "B" -> 11.0; "C" -> 12.0; "D" -> 13.0; "E" -> 14.0; "F" -> 15.0
+        _ -> error "invalid hex digit"
+      -- Keep headroom so the next (acc * 16 + 15) cannot exceed the Decimal max.
+      step : Decimal -> Text -> Decimal
+      step acc c =
+        let acc' = acc * 16.0 + hexVal c
+        in if acc' > 5.0e26 then error "hex value too large for Decimal" else acc'
+  in if T.length s == 0 then (0.0 : Decimal)
+     else foldl step (0.0 : Decimal) (T.explode s)
+
+-- | Convert a 256-bit big-endian hex word to Decimal, reading it as a two's-complement signed
+-- integer.
+--
+-- V3 `benchmarkPrice` / `bid` / `ask` are `int192`, sign-extended into the 256-bit word, so a
+-- negative value is all-`f` in its high bytes; read with `hexToUnsignedDecimal` it would trip the
+-- overflow guard with a misleading "too large" error. Decoded signed, a negative price comes out
+-- negative and is then rejected by the price store ("Price must be positive"). Every non-negative
+-- word decodes exactly as the unsigned case.
+--
+-- When the top bit (first nibble >= 8) is clear the word decodes exactly as the unsigned case.
+-- When set, the magnitude is (~word) + 1: complementing every nibble turns the all-`f` high bytes
+-- into zeros, so a realistic negative price decodes without tripping the guard.
+hexToSignedDecimal : Text -> Decimal
+hexToSignedDecimal hex = case T.explode hex of
+  [] -> 0.0
+  first :: _ ->
+    if hexToUnsignedDecimal first < 8.0
+      then hexToUnsignedDecimal hex
+      else negate (hexToUnsignedDecimal (T.implode (map complementNibble (T.explode hex))) + 1.0)
+
+-- | The hex digit whose value is 15 minus the given digit's (one's complement of a nibble).
+complementNibble : Text -> Text
+complementNibble c = case c of
+  "0" -> "f"; "1" -> "e"; "2" -> "d"; "3" -> "c"; "4" -> "b"; "5" -> "a"; "6" -> "9"; "7" -> "8"
+  "8" -> "7"; "9" -> "6"; "a" -> "5"; "b" -> "4"; "c" -> "3"; "d" -> "2"; "e" -> "1"; "f" -> "0"
+  "A" -> "5"; "B" -> "4"; "C" -> "3"; "D" -> "2"; "E" -> "1"; "F" -> "0"
+  _ -> error "invalid hex digit"

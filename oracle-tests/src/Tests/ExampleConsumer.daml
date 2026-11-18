@@ -1,0 +1,82 @@
+-- Copyright 2026 Sats Labs Inc. (d/b/a Palladium Labs)
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Tests for the example consumer (`oracle-example-consumer`): reading a price from another
+-- template's choice, with the store passed as a disclosed contract.
+module Tests.ExampleConsumer where
+
+import Daml.Script
+import DA.Optional (fromSomeNote)
+import DA.Time (seconds)
+import DA.TextMap qualified as TextMap
+import Palladium.Oracle.PriceStore (PriceStore, RegisterFeed(..))
+import Palladium.Oracle.PriceStore qualified as PS
+import Palladium.Oracle.Example.CollateralValuation (Holding(..), Value(..))
+import Tests.PriceStore (mkStore, record, assertEq, btcRaw)
+
+-- EX-01: the owner values a holding through a label, using the disclosed store.
+testEX01 : Script ()
+testEX01 = do
+  (op, _, s1) <- mkStore "ex01" 3600
+  s2 <- record op s1 btcRaw 90000.0
+  s3 <- submit op $ exerciseCmd s2 RegisterFeed with label = "BTC-USD", rawFeedId = btcRaw
+  owner <- allocateParty "ex01-owner"
+  h <- submit op $ createCmd Holding with operator = op, owner, feed = "BTC-USD", quantity = 0.5
+  store <- fromSomeNote "store disclosure" <$> queryDisclosure @PriceStore op s3
+  v <- submitWithDisclosures owner [store] $ exerciseCmd h Value with storeCid = s3
+  assertEq "EX-01 value" 45000.0 v
+
+-- EX-02: without the disclosure the owner cannot see the store, so the read fails.
+testEX02 : Script ()
+testEX02 = do
+  (op, _, s1) <- mkStore "ex02" 3600
+  s2 <- record op s1 btcRaw 90000.0
+  owner <- allocateParty "ex02-owner"
+  h <- submit op $ createCmd Holding with operator = op, owner, feed = btcRaw, quantity = 1.0
+  submitMustFail owner $ exerciseCmd h Value with storeCid = s2
+  -- Control: the same call with the disclosure succeeds.
+  store <- fromSomeNote "store disclosure" <$> queryDisclosure @PriceStore op s2
+  v <- submitWithDisclosures owner [store] $ exerciseCmd h Value with storeCid = s2
+  assertEq "EX-02 value" 90000.0 v
+
+-- EX-03: a stale price aborts the consumer's choice instead of returning an old value.
+testEX03 : Script ()
+testEX03 = do
+  (op, _, s1) <- mkStore "ex03" 3600
+  s2 <- record op s1 btcRaw 90000.0
+  owner <- allocateParty "ex03-owner"
+  h <- submit op $ createCmd Holding with operator = op, owner, feed = btcRaw, quantity = 1.0
+  passTime (seconds 3601)
+  store <- fromSomeNote "store disclosure" <$> queryDisclosure @PriceStore op s2
+  submitWithDisclosuresMustFail owner [store] $ exerciseCmd h Value with storeCid = s2
+
+-- EX-04: the owner cannot value a holding from a store of their own. `PriceStore` is signed by its
+-- operator alone, so the owner can create one naming themselves as operator, with any price in it.
+-- `Value` must reject a store that is not signed by the holding's operator.
+testEX04 : Script ()
+testEX04 = do
+  (op, _, s1) <- mkStore "ex04" 3600
+  s2 <- record op s1 btcRaw 90000.0
+  owner <- allocateParty "ex04-owner"
+  h <- submit op $ createCmd Holding with operator = op, owner, feed = btcRaw, quantity = 1.0
+  now <- getTime
+  -- A fresh, positive price, so the only thing wrong with this store is who signed it.
+  let fakePrice = PS.PriceData with
+        price = 1000000000.0
+        feedId = btcRaw
+        observationsTimestamp = PS.epochSeconds now
+        updatedAt = now
+  fake <- submit owner $ createCmd PS.PriceStore with
+    operator = owner
+    oraclePusher = owner
+    prices = TextMap.fromList [(btcRaw, fakePrice)]
+    pendingPrices = TextMap.empty
+    feedAliases = TextMap.empty
+    maxStalenessSeconds = 3600
+    lenientMaxStalenessSeconds = 3600
+    maxDeviationBps = 1000
+  submitMustFail owner $ exerciseCmd h Value with storeCid = fake
+  -- Control: the operator's own store still works for the same holding.
+  store <- fromSomeNote "store disclosure" <$> queryDisclosure @PriceStore op s2
+  v <- submitWithDisclosures owner [store] $ exerciseCmd h Value with storeCid = s2
+  assertEq "EX-04 value from the operator's store" 90000.0 v

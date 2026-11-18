@@ -1,0 +1,27 @@
+-- Copyright 2026 Sats Labs Inc. (d/b/a Palladium Labs)
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | test-only `VerifiedPriceSink` that records whatever it is handed, with no policy at all.
+--
+-- The real price store rejects future observation timestamps and non-monotonic reports, and those
+-- guards fire before some of the feeder's own report-window checks can be observed. Pushing at this
+-- sink instead leaves the feeder's guards as the only possible failure, so each one can be tested in
+-- isolation. Never use this outside the test suite.
+module Tests.RecordingSink where
+
+import Palladium.Oracle.VerifiedPriceSink
+
+template RecordingSink
+  with
+    operator : Party
+    readers : [Party]
+    recorded : [(Text, Decimal, Decimal)]   -- (feedId, price, observationsTimestamp), newest first
+  where
+    signatory operator
+    observer readers
+
+    interface instance VerifiedPriceSink for RecordingSink where
+      view = VerifiedPriceSinkView with operator
+      recordVerifiedPrice feedId price observationsTimestamp = do
+        cid <- create this with recorded = (feedId, price, observationsTimestamp) :: recorded
+        pure (toInterfaceContractId @VerifiedPriceSink cid)

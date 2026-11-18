@@ -1,0 +1,30 @@
+{
+  "name": "@palladiumlabs/canton-oracle-pusher",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Example pusher that fetches signed Chainlink Data Streams V3 reports and writes them to a canton-oracle-kit PriceStore.",
+  "license": "Apache-2.0",
+  "author": "Sats Labs Inc. (d/b/a Palladium Labs)",
+  "type": "commonjs",
+  "main": "src/index.js",
+  "bin": {
+    "canton-oracle-pusher": "bin/pusher.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    ".env.example",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "setup": "node bin/pusher.js setup",
+    "probe": "node bin/pusher.js probe",
+    "start": "node bin/pusher.js start",
+    "current-store": "node bin/pusher.js current-store",
+    "test": "node --test \"test/**/*.test.js\"",
+    "lint": "node scripts/lint.js"
+  }
+}

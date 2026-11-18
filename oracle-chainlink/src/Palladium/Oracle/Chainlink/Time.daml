@@ -1,0 +1,14 @@
+-- Copyright 2026 Sats Labs Inc. (d/b/a Palladium Labs)
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Time helper. The price store (oracle-price-store) carries an identical copy: it must not depend
+-- on this package, because this package pulls in the Chainlink DARs.
+module Palladium.Oracle.Chainlink.Time where
+
+import DA.Time
+import DA.Date (date, Month(..))
+
+-- | Current ledger time as Unix epoch seconds.
+epochSeconds : Time -> Decimal
+epochSeconds t =
+  intToDecimal (convertRelTimeToMicroseconds (subTime t (time (date 1970 Jan 1) 0 0 0))) / 1000000.0

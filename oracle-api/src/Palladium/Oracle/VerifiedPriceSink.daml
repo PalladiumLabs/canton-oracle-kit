@@ -1,0 +1,32 @@
+-- Copyright 2026 Sats Labs Inc. (d/b/a Palladium Labs)
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | The boundary between a price feeder and the price store it writes to.
+--
+-- A feeder (e.g. `Palladium.Oracle.Chainlink.ChainlinkPriceFeeder`) does the source-specific work —
+-- signature verification, decoding, report-window checks — and hands the resulting price to
+-- whatever implements this interface. It lives in its own package so feeders and stores can each
+-- be upgraded without touching the other.
+module Palladium.Oracle.VerifiedPriceSink where
+
+-- | The single party authorised to record prices into the sink.
+data VerifiedPriceSinkView = VerifiedPriceSinkView
+  with
+    operator : Party
+  deriving (Eq, Show)
+
+interface VerifiedPriceSink where
+  viewtype VerifiedPriceSinkView
+
+  recordVerifiedPrice : Text -> Decimal -> Decimal -> Update (ContractId VerifiedPriceSink)
+
+  -- | Record an already-verified price. The implementation does not verify anything: "verified" is
+  -- the caller's obligation. `controller operator` means any contract signed by the operator can
+  -- reach it, so a feeder must be signed by the same operator to call it.
+  choice RecordVerifiedPrice : ContractId VerifiedPriceSink
+    with
+      feedId : Text                    -- the raw feed id from the report, never a label
+      price : Decimal                  -- already scaled to human units
+      observationsTimestamp : Decimal  -- Unix seconds at which the price was observed
+    controller (view this).operator
+    do recordVerifiedPrice this feedId price observationsTimestamp

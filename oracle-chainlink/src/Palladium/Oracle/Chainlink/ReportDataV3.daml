@@ -1,0 +1,42 @@
+-- Copyright 2026 Sats Labs Inc. (d/b/a Palladium Labs)
+-- SPDX-License-Identifier: Apache-2.0
+-- Portions adapted from Chainlink's Data Streams Canton examples.
+-- Copyright (c) 2018 SmartContract ChainLink Limited SEZC. Licensed under the MIT License; see THIRD_PARTY_NOTICES.md.
+
+-- | V3 Report Decoder for Chainlink Data Streams.
+-- Adapted from the data-streams-canton examples (MIT; see THIRD_PARTY_NOTICES.md).
+module Palladium.Oracle.Chainlink.ReportDataV3 where
+
+import ReportPayloadDecoder (extractWord, wordSize)
+import DA.Crypto.Text (BytesHex, byteCount)
+import Palladium.Oracle.Chainlink.HexToDecimal (hexToSignedDecimal, hexToUnsignedDecimal)
+
+-- | Decoded Chainlink V3 report data.
+data ReportDataV3 = ReportDataV3
+  with
+    feedId                : BytesHex
+    validFromTimestamp    : Decimal
+    observationsTimestamp : Decimal
+    nativeFee             : Decimal
+    linkFee               : Decimal
+    expiresAt             : Decimal
+    benchmarkPrice        : Decimal
+    bid                   : Decimal
+    ask                   : Decimal
+  deriving (Eq, Show)
+
+-- | Parse verified report data bytes into a V3 report structure.
+-- The three int192 price words are read as signed; see `hexToSignedDecimal` for why.
+parseReportDataV3 : BytesHex -> ReportDataV3
+parseReportDataV3 d | byteCount d /= 9 * wordSize = error "bad size"
+parseReportDataV3 d = ReportDataV3
+  { feedId                = extractWord d 0
+  , validFromTimestamp    = hexToUnsignedDecimal (extractWord d 1)
+  , observationsTimestamp = hexToUnsignedDecimal (extractWord d 2)
+  , nativeFee             = hexToUnsignedDecimal (extractWord d 3)
+  , linkFee               = hexToUnsignedDecimal (extractWord d 4)
+  , expiresAt             = hexToUnsignedDecimal (extractWord d 5)
+  , benchmarkPrice        = hexToSignedDecimal (extractWord d 6)
+  , bid                   = hexToSignedDecimal (extractWord d 7)
+  , ask                   = hexToSignedDecimal (extractWord d 8)
+  }

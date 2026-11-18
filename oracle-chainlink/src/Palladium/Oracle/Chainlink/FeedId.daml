@@ -1,0 +1,17 @@
+-- Copyright 2026 Sats Labs Inc. (d/b/a Palladium Labs)
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Feed-id format predicate. Deliberately dependency-free (DA.Text only).
+--
+-- The price store (oracle-price-store) carries an identical copy: it must not depend on this
+-- package, because this package pulls in the Chainlink DARs.
+module Palladium.Oracle.Chainlink.FeedId where
+
+import DA.Text qualified as T
+
+-- | Check if a feed ID is a V3 feed (starts with "0003").
+--
+-- The price-write path asserts it before the report's fields are read by position — a different
+-- schema version would otherwise be silently misread, taking the price from the wrong word.
+isV3FeedId : Text -> Bool
+isV3FeedId = (== "0003") . T.take 4

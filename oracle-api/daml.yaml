@@ -1,0 +1,10 @@
+# The stable boundary other packages depend on. Keep it minimal: it contains the VerifiedPriceSink
+# interface and nothing else, so feeders and price stores can upgrade independently of it.
+name: oracle-api
+version: 1.0.0
+sdk-version: 3.4.11
+
+source: src
+dependencies:
+  - daml-prim
+  - daml-stdlib

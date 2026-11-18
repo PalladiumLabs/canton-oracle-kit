@@ -1,0 +1,31 @@
+-- Copyright 2026 Sats Labs Inc. (d/b/a Palladium Labs)
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Feed-id format predicate. Deliberately dependency-free (DA.Text only).
+--
+-- Why this lives here and not only in oracle-chainlink: that package decodes a Chainlink report and
+-- therefore depends on the Chainlink `domain` DAR. Importing `isV3FeedId` from there would drag the
+-- whole Chainlink dependency closure into the price store, and hence onto the participant of every
+-- party that is merely an informee on a transaction that reads a price. `RegisterFeed` and
+-- `RecordVerifiedPrice` need this predicate; nothing else about Chainlink belongs on this side of
+-- the package boundary.
+module Palladium.Oracle.PriceStore.FeedId where
+
+import DA.Text qualified as T
+
+-- | Check if a feed ID is a V3 feed (starts with "0003").
+--
+-- Two callers, for two different reasons:
+--   * the price-write path asserts it before the report's fields are read by position —
+--     a different schema version would otherwise be silently misread, taking the price from the
+--     wrong word. That check lives in the Chainlink feeder package, where the decoding happens, and
+--     `RecordVerifiedPrice` repeats it on this side of the boundary.
+--   * `RegisterFeed` asserts it on the raw id so a label can never be bound to an id that no
+--     verified report could ever carry — which would leave that label permanently unpriceable with
+--     no error until someone tried to use it.
+--
+-- Note the coupling this creates: the store is otherwise feeder-agnostic, but this one predicate
+-- hard-codes the Chainlink Data Streams V3 convention. That is correct while Chainlink is the only
+-- price source. Adding a second source means relaxing this, not working around it.
+isV3FeedId : Text -> Bool
+isV3FeedId = (== "0003") . T.take 4

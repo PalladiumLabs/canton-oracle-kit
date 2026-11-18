@@ -1,0 +1,15 @@
+name: Integration question
+description: A question about integrating the kit into your Canton application.
+labels: [question]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: What are you trying to do?
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Your setup
+      description: Network (LocalNet, DevNet, TestNet, MainNet), which parties host what, and what you have tried.

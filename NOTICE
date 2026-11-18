@@ -1,0 +1,8 @@
+canton-oracle-kit
+Copyright 2026 Sats Labs Inc. (d/b/a Palladium Labs)
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product adapts code from, and builds against, Chainlink's Data Streams Canton integration,
+which is licensed under the MIT License (Copyright (c) 2018 SmartContract ChainLink Limited SEZC).
+See THIRD_PARTY_NOTICES.md for details and the full MIT license text.

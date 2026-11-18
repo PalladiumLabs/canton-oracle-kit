@@ -1,0 +1,26 @@
+name: oracle-tests
+version: 1.0.0
+sdk-version: 3.4.11
+
+source: src
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+
+data-dependencies:
+  - ../oracle-api/.daml/dist/oracle-api-1.0.0.dar
+  - ../oracle-chainlink/.daml/dist/oracle-chainlink-1.0.0.dar
+  - ../oracle-price-store/.daml/dist/oracle-price-store-1.0.0.dar
+  - ../oracle-example-consumer/.daml/dist/oracle-example-consumer-1.0.0.dar
+  # Chainlink Data Streams contracts (MIT; see THIRD_PARTY_NOTICES.md), fetched by
+  # ./scripts/fetch-dars.sh. The suite needs `domain` for PayloadBuilder.
+  - ../data-streams-dars/verifier-1.0.0.dar
+  - ../data-streams-dars/verifier-config-1.0.0.dar
+  - ../data-streams-dars/domain-1.0.0.dar
+  - ../data-streams-dars/common-1.0.0.dar
+
+build-options:
+  - -Wno-crypto-text-is-alpha
+  # Tests.RecordingSink is a test-only template; this package is never deployed.
+  - -Wno-template-interface-depends-on-daml-script

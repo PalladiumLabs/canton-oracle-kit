@@ -1,0 +1,185 @@
+-- Copyright 2026 Sats Labs Inc. (d/b/a Palladium Labs)
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Chainlink Data Streams price ingestion.
+--
+-- Why this package exists. Ingesting a Chainlink report needs four third-party Chainlink DARs
+-- (verifier, verifier-config, domain, common): the feeder holds `ContractId Verifier` /
+-- `ContractId VerifierConfig` fields and the decoder imports `ReportPayloadDecoder` from `domain`.
+-- Canton requires a package's full closure wherever the package is vetted, so if the price store
+-- carried these fields, every participant hosting a party that is merely an informee on a
+-- transaction reading prices would have to vet Chainlink code. Keeping the ingestion path in this
+-- separate package keeps those four packages out of that closure, while the price store keeps
+-- every template a consumer reads from.
+--
+-- The security argument. `ChainlinkPriceFeeder` is `signatory operator`, so a choice body on
+-- it runs with operator authority — which is what lets it reach the operator-controlled
+-- `RecordVerifiedPrice` choice of a `VerifiedPriceSink`. The hot `oraclePusher` key holds no
+-- operator authority of its own, so the only way it can write a price is through
+-- `PushVerifiedPrice`, whose body runs `Verifier.Verify` against the verifier pinned on this
+-- contract. A compromised hot key therefore cannot forge prices. The pin is a field here, writable
+-- only by an operator-signed transaction.
+--
+-- What it does not prevent. This does not stop an operator-signed transaction from writing a price directly via
+-- `RecordVerifiedPrice`. That was never preventable — the price store is `signatory operator` alone,
+-- so an operator-signed transaction can archive and recreate it with arbitrary prices regardless. The control there is
+-- off-ledger: every change to `prices` should appear in the transaction tree as a child of a
+-- `PushVerifiedPrice` exercise, and one that is not is an incident. See SECURITY.md.
+module Palladium.Oracle.Chainlink where
+
+import DA.Crypto.Text (BytesHex)
+import DA.Map qualified as GMap
+import Verifier (Verifier, Verify(..))
+import VerifierConfig (VerifierConfig(..))
+import Palladium.Oracle.Chainlink.ReportDataV3 (parseReportDataV3)
+import Palladium.Oracle.Chainlink.FeedId (isV3FeedId)
+import Palladium.Oracle.Chainlink.Time (epochSeconds)
+import Palladium.Oracle.VerifiedPriceSink (VerifiedPriceSink, RecordVerifiedPrice(..))
+
+-- | Validates both halves of the pinned pair before it is adopted:
+--
+--   * fetch the verifier. No assertion is needed: fetching a non-existent or archived
+--     contract aborts by itself. Pinning a mistyped or rotated-out verifier would otherwise be
+--     accepted, and then every push aborts at verification — with no manual-price fallback the
+--     store produces no prices at all, and every consumer's strict read fails once the last good
+--     price passes its staleness bound. This moves the failure from the pusher's next push to the
+--     operator-signed transaction, where the operator sees it immediately.
+--   * the config must carry at least one active digest with f >= 1. A digest with f = 0
+--     verifies on a single signature, so one compromised DON signer could forge every price.
+--
+-- Deployment note: operator must have both the Chainlink Verifier and its VerifierConfig
+-- disclosed when running any choice that calls this.
+validateVerifierPair : Party -> ContractId Verifier -> ContractId VerifierConfig -> Update ()
+validateVerifierPair expectedConfigOwner vCid cCid = do
+  _ <- fetch vCid
+  cfg <- fetch cCid
+  -- Provenance. `VerifierConfig` is `signatory confirmedOwnerView.owner` and is creatable by any
+  -- party — a `Verifier` holds no keys, so all trust sits in the config's `oracles` map. Without
+  -- this check, one RotateVerifier to a self-minted config carrying the caller's own public keys
+  -- makes every self-signed report pass `Verify`, and the resulting transaction tree is
+  -- indistinguishable from a legitimate push. That would defeat the off-ledger control this whole
+  -- design delegates to (see the module header), so shape checks alone are not enough.
+  assertMsg ("VerifierConfig is not owned by the expected Chainlink config owner. Expected: " <>
+             show expectedConfigOwner <> ", got: " <> show cfg.confirmedOwnerView.owner)
+            (cfg.confirmedOwnerView.owner == expectedConfigOwner)
+  let digests = GMap.values cfg.verifierConfigStateView.verifierStates
+      -- Usability. `Verifier.Verify` requires exactly `f + 1` unique signers matched against this
+      -- digest's `oracles` map (verifier-1.0.0 Verifier.daml:53 and :100-101). A digest with fewer
+      -- signers than that can never verify anything, so pinning it is the same silent
+      -- no-prices-at-all failure the verifier fetch exists to move forward to the operator's own transaction — an
+      -- f = 1 digest with an empty oracles map passes every shape check and is completely inert.
+      -- Deliberately `>= f + 1` and not Chainlink's stronger BFT policy (numSigners > 3f, enforced by
+      -- their MasterVerifierConfigFactory): f + 1 is what verification provably needs, so it cannot
+      -- reject a config that would actually work. Check the BFT margin operationally instead.
+      usableDigests = filter (\d -> d.isActive
+                                 && d.f >= 1
+                                 && GMap.size d.oracles >= d.f + 1) digests
+  assertMsg "VerifierConfig has no config digests at all" (not (null digests))
+  assertMsg ("VerifierConfig has no ACTIVE, USABLE digest: it needs f >= 1 (a config with f = 0 " <>
+             "verifies on a single signature, so one compromised DON signer could forge every " <>
+             "price) AND at least f + 1 signers in its oracles map (fewer can never verify)")
+            (not (null usableDigests))
+
+-- | Operator-signed feeder holding the pinned Chainlink verifier pair. One per price store.
+--
+-- Create it at initial deployment while the pusher is stopped. Because `validateVerifierPair` performs
+-- Update actions it cannot live in an `ensure`, so a direct `create` bypasses it. Nothing is lost,
+-- but run `ValidateVerifier` immediately after initial deployment; it exists precisely so the invariant is
+-- checkable even though it cannot be enforced at creation.
+template ChainlinkPriceFeeder
+  with
+    operator : Party
+    oraclePusher : Party
+    verifierCid : ContractId Verifier
+    verifierConfigCid : ContractId VerifierConfig
+    -- The party we require to own the pinned VerifierConfig. Pinned as a field rather than passed
+    -- per call, for the same reason the verifier cid is: a caller-supplied expectation is no
+    -- expectation at all. Set at initial deployment to Chainlink's config-owner party.
+    expectedConfigOwner : Party
+  where
+    signatory operator
+    -- The pusher must be able to see this contract to exercise PushVerifiedPrice on it.
+    observer oraclePusher
+
+    -- | Verify a signed Chainlink report and record the price it carries.
+    --
+    -- `nonconsuming`, so the feeder's cid never rotates — the pusher can hold it indefinitely and it
+    -- is stable enough to prepare an operator transaction against.
+    nonconsuming choice PushVerifiedPrice : ContractId VerifiedPriceSink
+      with
+        sinkCid : ContractId VerifiedPriceSink
+        signedReportBytes : BytesHex
+      controller oraclePusher
+      do
+        -- Step 1: on-chain cryptographic verification (f+1 ECDSA signatures) against the pinned
+        -- pair. Neither cid is a parameter — that is the pin.
+        reportDataBytes <- exercise verifierCid Verify with
+          configCid = verifierConfigCid
+          signedReportBytes = signedReportBytes
+          sender = oraclePusher
+
+        -- Step 2: decode. Reject a non-V3 schema before any field is read by position.
+        -- The signature is verified upstream, but a different schema version would otherwise be
+        -- silently misread, taking the price from the wrong word. This check belongs here, with the
+        -- decoding; the price store additionally constrains `RecordVerifiedPrice` to raw 0003 ids,
+        -- so the guard holds on both sides of the boundary.
+        let report = parseReportDataV3 reportDataBytes
+        assertMsg "Report is not a V3-schema report (feedId prefix /= 0003)" (isV3FeedId report.feedId)
+
+        -- Step 3: the two report-window checks. These live here rather than in the store because
+        -- they need only the report — passing `validFromTimestamp` and `expiresAt` across the
+        -- boundary would mean the store carrying fields it has no other use for.
+        currentTime <- getTime
+        let nowSeconds = epochSeconds currentTime
+        assertMsg "Report not yet valid (validFromTimestamp is in the future)"
+          (report.validFromTimestamp <= nowSeconds)
+        assertMsg "Report has expired (expiresAt in the past)" (nowSeconds <= report.expiresAt)
+
+        -- Step 4: hand the verified price to the sink. Everything that needs store state stays
+        -- there — positivity, observation-timestamp staleness, monotonicity, and the deviation /
+        -- pendingPrices confirmation.
+        -- Chainlink Data Streams V3 delivers 18-decimal fixed point; scale to human units here so
+        -- the store never has to know the wire format.
+        exercise sinkCid RecordVerifiedPrice with
+          feedId = report.feedId
+          price = report.benchmarkPrice / 1.0e18
+          observationsTimestamp = report.observationsTimestamp
+
+    -- | Rotate the pinned pair. operator only — a hot key that could re-point the verifier could
+    -- re-point it at a rogue one, which is the whole vulnerability the pin closes.
+    --
+    -- This choice must exist from initial deployment: migration is one-way, and a feeder pinned to a cid that
+    -- later goes stale (Splice hard domain migration, re-creation of the Chainlink contracts, or a Chainlink config rotation)
+    -- would otherwise be frozen permanently with no recovery short of redeploying.
+    choice RotateVerifier : ContractId ChainlinkPriceFeeder
+      with
+        newVerifierCid : ContractId Verifier
+        newVerifierConfigCid : ContractId VerifierConfig
+      controller operator
+      do
+        validateVerifierPair expectedConfigOwner newVerifierCid newVerifierConfigCid
+        create this with
+          verifierCid = newVerifierCid
+          verifierConfigCid = newVerifierConfigCid
+
+    -- | Rotate the hot pusher key. operator only.
+    --
+    -- Rotating only one contract does not revoke a leaked key. After rotating only the store, the
+    -- revoked key can still exercise PushVerifiedPrice on this feeder with a genuine, still-valid
+    -- report. Full revocation means rotating every contract that names the pusher — this feeder and
+    -- the price store, plus anything a consumer built that names it. See SECURITY.md.
+    choice RotateOraclePusher : ContractId ChainlinkPriceFeeder
+      with
+        newOraclePusher : Party
+      controller operator
+      do create this with oraclePusher = newOraclePusher
+
+    -- | Operator diagnostic: re-run `validateVerifierPair` against the currently pinned pair.
+    --
+    -- Exists because `validateVerifierPair` cannot be an `ensure`, so a direct `create` of this
+    -- template bypasses it. Run this immediately after initial deployment and after any Chainlink config
+    -- change: an invariant that cannot be enforced at creation, made checkable on demand instead.
+    -- Nonconsuming — it is a pure assertion.
+    nonconsuming choice ValidateVerifier : ()
+      controller operator
+      do validateVerifierPair expectedConfigOwner verifierCid verifierConfigCid

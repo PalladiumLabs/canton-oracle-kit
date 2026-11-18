@@ -1,0 +1,440 @@
+-- Copyright 2026 Sats Labs Inc. (d/b/a Palladium Labs)
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Tests for the price store (`oracle-price-store`).
+--
+-- Every guard has one passing and one failing case. Prices are seeded through
+-- `RecordVerifiedPrice`, the store's only write path.
+module Tests.PriceStore where
+
+import Daml.Script
+import DA.Time (days, seconds)
+import DA.TextMap qualified as TextMap
+import Palladium.Oracle.VerifiedPriceSink (VerifiedPriceSink, RecordVerifiedPrice(..))
+import Palladium.Oracle.PriceStore (PriceStore(..), GetPrice(..), GetPriceWithStaleness(..),
+                                    RegisterFeed(..), PriceData(..),
+                                    withinDeviation, priceIsRecent, epochSeconds,
+                                    decidePriceUpdate, PriceUpdateAction(..), isNewerThanActive)
+import Palladium.Oracle.PriceStore.FeedId (isV3FeedId)
+
+assertEq : (Eq a, Show a) => Text -> a -> a -> Script ()
+assertEq label expected actual =
+  assertMsg (label <> ": expected " <> show expected <> " but got " <> show actual)
+            (expected == actual)
+
+passSeconds : Int -> Script ()
+passSeconds n = passTime (seconds n)
+
+ethRaw : Text
+ethRaw = "0003aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+btcRaw : Text
+btcRaw = "0003bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+-- | A store with distinct operator / pusher, the given strict staleness bound, a 1-day lenient bound
+-- and an effectively unbounded deviation cap (so only PS-16 exercises the deviation hold). Time is
+-- moved off the epoch so "now - n" is a representable past instant.
+mkStore : Text -> Int -> Script (Party, Party, ContractId PriceStore)
+mkStore tag maxStaleness = do
+  op <- allocateParty (tag <> "-op")
+  pusher <- allocateParty (tag <> "-pusher")
+  cid <- submit op $ createCmd PriceStore with
+    operator = op
+    oraclePusher = pusher
+    prices = TextMap.empty
+    pendingPrices = TextMap.empty
+    feedAliases = TextMap.empty
+    maxStalenessSeconds = maxStaleness
+    lenientMaxStalenessSeconds = 86400
+    maxDeviationBps = 100000000
+  passTime (days 1)
+  pure (op, pusher, cid)
+
+-- | Record a price observed now, as the feeder would after verifying a report.
+record : Party -> ContractId PriceStore -> Text -> Decimal -> Script (ContractId PriceStore)
+record op cid feedId price = do
+  now <- getTime
+  i <- submit op $ exerciseCmd (toInterfaceContractId @VerifiedPriceSink cid) RecordVerifiedPrice with
+    feedId, price, observationsTimestamp = epochSeconds now
+  pure (fromInterfaceContractId @PriceStore i)
+
+queryPrice : Party -> ContractId PriceStore -> Text -> Script Decimal
+queryPrice op cid feedId = do
+  pd <- submit op $ exerciseCmd cid GetPrice with feedId
+  pure pd.price
+
+-- PS-01: GetPrice returns the stored price for multiple feeds.
+testPS01 : Script ()
+testPS01 = do
+  (op, _, o1) <- mkStore "ps01" 3600
+  o2 <- record op o1 ethRaw 2500.0
+  o3 <- record op o2 btcRaw 90000.0
+  p1 <- queryPrice op o3 ethRaw
+  p2 <- queryPrice op o3 btcRaw
+  assertEq "PS-01 ETH" 2500.0 p1
+  assertEq "PS-01 BTC" 90000.0 p2
+
+-- PS-02: GetPrice on an unknown feed aborts.
+testPS02 : Script ()
+testPS02 = do
+  (op, _, o1) <- mkStore "ps02" 3600
+  o2 <- record op o1 ethRaw 2500.0
+  submitMustFail op $ exerciseCmd o2 GetPrice with feedId = btcRaw
+
+-- PS-03: GetPrice on a stale price aborts.
+testPS03 : Script ()
+testPS03 = do
+  (op, _, o1) <- mkStore "ps03" 3600
+  o2 <- record op o1 ethRaw 2500.0
+  passSeconds (3600 + 60)  -- past the staleness window
+  submitMustFail op $ exerciseCmd o2 GetPrice with feedId = ethRaw
+
+-- PS-04: GetPrice at the exact staleness boundary is accepted.
+testPS04 : Script ()
+testPS04 = do
+  (op, _, o1) <- mkStore "ps04" 3600
+  o2 <- record op o1 ethRaw 2500.0
+  passSeconds 3600   -- exactly at boundary; age <= maxStalenessSeconds
+  price <- queryPrice op o2 ethRaw
+  assertEq "PS-04" 2500.0 price
+
+-- PS-05: a newer report overwrites the price and advances the timestamp.
+testPS05 : Script ()
+testPS05 = do
+  (op, _, o1) <- mkStore "ps05" 3600
+  o2 <- record op o1 ethRaw 2500.0
+  pd1 <- submit op $ exerciseCmd o2 GetPrice with feedId = ethRaw
+  passSeconds 60
+  o3 <- record op o2 ethRaw 2600.0
+  pd2 <- submit op $ exerciseCmd o3 GetPrice with feedId = ethRaw
+  assertMsg "PS-05 timestamp advanced" (pd2.observationsTimestamp > pd1.observationsTimestamp)
+  assertEq "PS-05 price updated" 2600.0 pd2.price
+
+-- PS-06: deviation guard (pure). Within tolerance accepted, beyond rejected, and a non-positive
+-- previous price is treated as "no prior" (accept).
+testPS06 : Script ()
+testPS06 = do
+  assertMsg "PS-06 within 10%"  (withinDeviation 100.0 105.0 1000)
+  assertMsg "PS-06 beyond 10%"  (not (withinDeviation 100.0 120.0 1000))
+  assertMsg "PS-06 at boundary" (withinDeviation 100.0 110.0 1000)
+  assertMsg "PS-06 zero prior"  (withinDeviation 0.0 100.0 1000)
+
+-- PS-07: staleness guard (pure). Future timestamps (negative age) are rejected, recent ones
+-- accepted, stale ones rejected.
+testPS07 : Script ()
+testPS07 = do
+  now <- getTime
+  let nowS = epochSeconds now
+  assertMsg "PS-07 future rejected" (not (priceIsRecent (nowS + 100.0) now 3600))
+  assertMsg "PS-07 recent accepted" (priceIsRecent (nowS - 10.0) now 3600)
+  assertMsg "PS-07 stale rejected"  (not (priceIsRecent (nowS - 7200.0) now 3600))
+
+-- PS-08: feed-key alias fallback. The verified path stores prices under the raw 32-byte
+-- report.feedId, but a consumer may read by a human label. After RegisterFeed maps the label to the
+-- raw id, GetPrice by the label resolves to the price stored under the raw id.
+testPS08 : Script ()
+testPS08 = do
+  (op, _, o0) <- mkStore "ps08" 3600
+  o1 <- record op o0 ethRaw 2500.0
+  -- Before the alias exists the label cannot be read.
+  submitMustFail op $ exerciseCmd o1 GetPrice with feedId = "ETH-USD"
+  -- Register the alias (config authority), then the human label resolves through it.
+  o2 <- submit op $ exerciseCmd o1 RegisterFeed with label = "ETH-USD", rawFeedId = ethRaw
+  pd <- submit op $ exerciseCmd o2 GetPrice with feedId = "ETH-USD"
+  assertEq "PS-08 label resolves via alias to raw-keyed price" 2500.0 pd.price
+  -- Direct read by the raw id still works; an unregistered label with no price still aborts.
+  pdRaw <- submit op $ exerciseCmd o2 GetPrice with feedId = ethRaw
+  assertEq "PS-08 direct raw-id read still works" 2500.0 pdRaw.price
+  submitMustFail op $ exerciseCmd o2 GetPrice with feedId = "BTC-USD"
+
+-- PS-09: the deviation guard requires a fresh pending to corroborate a large move. A stale pending
+-- cannot rubber-stamp it; the new value is held instead. (Pure-helper test; PS-16 runs the same
+-- state machine through the choice.)
+testPS09 : Script ()
+testPS09 = do
+  now <- getTime
+  let nowS  = epochSeconds now
+      dev   = 1000     -- 10%
+      stale = 3600     -- 1h staleness/TTL bound
+      mk price obsTs = PriceData with price, feedId = ethRaw, observationsTimestamp = obsTs, updatedAt = now
+      active        = mk 2500.0 nowS
+      freshPend1500 = mk 1500.0 nowS
+      stalePend1500 = mk 1500.0 (nowS - 4000.0)   -- older than the 3600s bound
+      freshPend2000 = mk 2000.0 nowS
+  assertEq "PS-09 first price activates"
+    Activate    (decidePriceUpdate None (None : Optional PriceData) 1500.0 dev now stale)
+  assertEq "PS-09 small move activates"
+    Activate    (decidePriceUpdate (Some active) None 2510.0 dev now stale)
+  assertEq "PS-09 large move, no pending -> hold"
+    HoldPending (decidePriceUpdate (Some active) None 1500.0 dev now stale)
+  assertEq "PS-09 large move + FRESH corroborating pending -> activate"
+    Activate    (decidePriceUpdate (Some active) (Some freshPend1500) 1500.0 dev now stale)
+  assertEq "PS-09 large move + STALE pending -> hold"
+    HoldPending (decidePriceUpdate (Some active) (Some stalePend1500) 1500.0 dev now stale)
+  assertEq "PS-09 large move + fresh but non-corroborating pending -> hold"
+    HoldPending (decidePriceUpdate (Some active) (Some freshPend2000) 1500.0 dev now stale)
+
+-- PS-10: the V3 schema-version predicate. V3 feed ids (prefix "0003") accepted, any other version
+-- rejected, so a non-V3 report is refused before V3 field extraction.
+testPS10 : Script ()
+testPS10 = do
+  assertMsg "PS-10 V3 feed id accepted"      (isV3FeedId "0003aaaabbbbccccddddeeeeffff")
+  assertMsg "PS-10 V2 feed id rejected"      (not (isV3FeedId "0002aaaabbbbccccddddeeeeffff"))
+  assertMsg "PS-10 V1 feed id rejected"      (not (isV3FeedId "0001aaaabbbbccccddddeeeeffff"))
+  assertMsg "PS-10 empty feed id rejected"   (not (isV3FeedId ""))
+  assertMsg "PS-10 0x-prefixed id rejected"  (not (isV3FeedId "0x0003aaaabbbbccccddddeeeeffff"))
+
+-- PS-11: observation-timestamp monotonicity (pure) — a report must be strictly newer than the
+-- stored active price; equal/older is rejected; first price (no active) accepted.
+testPS11 : Script ()
+testPS11 = do
+  now <- getTime
+  let mk obs = PriceData with price = 2500.0, feedId = ethRaw, observationsTimestamp = obs, updatedAt = now
+      active = mk 1000200.0
+  assertMsg "PS-11 first price (no active) accepted"   (isNewerThanActive None 1000100.0)
+  assertMsg "PS-11 strictly newer accepted"            (isNewerThanActive (Some active) 1000300.0)
+  assertMsg "PS-11 equal timestamp rejected"           (not (isNewerThanActive (Some active) 1000200.0))
+  assertMsg "PS-11 older timestamp rejected (rollback)" (not (isNewerThanActive (Some active) 1000100.0))
+
+-- PS-12: RegisterFeed is add-only. A plain insert would let a live label be silently re-pointed at
+-- another asset's raw feed, revaluing everything read through that label.
+testPS12_aliasIsAddOnly : Script ()
+testPS12_aliasIsAddOnly = do
+  (op, _, o0) <- mkStore "ps12" 3600
+  o1 <- record op o0 ethRaw 2500.0
+  o2 <- record op o1 btcRaw 90000.0
+  o3 <- submit op $ exerciseCmd o2 RegisterFeed with label = "ETH-USD", rawFeedId = ethRaw
+
+  -- (a) the attack: re-pointing the live "ETH-USD" label at BTC's feed is rejected.
+  submitMustFail op $ exerciseCmd o3 RegisterFeed with label = "ETH-USD", rawFeedId = btcRaw
+
+  -- (b) The label still resolves to ETH — no silent revaluation happened.
+  pd <- submit op $ exerciseCmd o3 GetPrice with feedId = "ETH-USD"
+  assertEq "PS-12 ETH label still resolves to the ETH price" 2500.0 pd.price
+
+  -- (c) Re-registering the same mapping is idempotent, so a retry / re-run is safe.
+  o4 <- submit op $ exerciseCmd o3 RegisterFeed with label = "ETH-USD", rawFeedId = ethRaw
+  pdAgain <- submit op $ exerciseCmd o4 GetPrice with feedId = "ETH-USD"
+  assertEq "PS-12 idempotent re-register keeps the mapping" 2500.0 pdAgain.price
+
+  -- (d) Registering a new label is unaffected — this is add-only, not frozen.
+  o5 <- submit op $ exerciseCmd o4 RegisterFeed with label = "BTC-USD", rawFeedId = btcRaw
+  pdBtc <- submit op $ exerciseCmd o5 GetPrice with feedId = "BTC-USD"
+  assertEq "PS-12 a new label can still be registered" 90000.0 pdBtc.price
+
+-- PS-13: the staleness bounds and deviation cap are validated by the template `ensure`. They have no
+-- other validation and no choice updates them, so a deployment-time mistake would be permanent.
+testPS13_stalenessOrderingEnforced : Script ()
+testPS13_stalenessOrderingEnforced = do
+  op <- allocateParty "ps13-op"
+  let mkWith maxStale lenientStale devBps = createCmd PriceStore with
+        operator = op
+        oraclePusher = op
+        prices = TextMap.empty
+        pendingPrices = TextMap.empty
+        feedAliases = TextMap.empty
+        maxStalenessSeconds = maxStale
+        lenientMaxStalenessSeconds = lenientStale
+        maxDeviationBps = devBps
+
+  -- (a) inverted bounds rejected: lenient bound stricter than the strict one.
+  submitMustFail op $ mkWith 3600 60 1000
+  -- (b) Zero/negative staleness rejected.
+  submitMustFail op $ mkWith 0 86400 1000
+  submitMustFail op $ mkWith (-1) 86400 1000
+  -- (c) Zero deviation bps rejected (every move would need corroboration forever).
+  submitMustFail op $ mkWith 3600 86400 0
+  -- (d) A typical shape is accepted, and equal bounds are legal (>=, not >).
+  _ <- submit op $ mkWith 3600 86400 1000
+  _ <- submit op $ mkWith 3600 3600 1000
+  pure ()
+
+-- PS-14: RegisterFeed rejects a raw id that is not a V3 Data Streams feed id. The verified path
+-- already rejects non-V3 reports, so such an alias could never receive a price.
+testPS14_registerFeedRejectsNonV3RawId : Script ()
+testPS14_registerFeedRejectsNonV3RawId = do
+  (op, _, oracleCid) <- mkStore "ps14" 3600
+  -- (a) A plainly wrong raw id (someone pasting the label into the raw field) is rejected.
+  submitMustFail op $ exerciseCmd oracleCid RegisterFeed with
+    label = "ETH-USD", rawFeedId = "ETH-USD"
+  -- (b) A hex-looking id with the wrong schema prefix (0002, not 0003) is rejected too.
+  submitMustFail op $ exerciseCmd oracleCid RegisterFeed with
+    label = "ETH-USD", rawFeedId = "0002aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  -- (c) control: a well-formed V3 id still registers, so the guard is a format check and not a block.
+  o2 <- submit op $ exerciseCmd oracleCid RegisterFeed with label = "ETH-USD", rawFeedId = ethRaw
+  Some ov <- queryContractId op o2
+  assertEq "PS-14 the V3 alias was registered" (Some ethRaw) (TextMap.lookup "ETH-USD" ov.feedAliases)
+
+--------------------------------------------------------------------------------
+-- PS-15 — RecordVerifiedPrice: the guards the store owns, and the hot-key property
+--------------------------------------------------------------------------------
+
+-- NOTE ON CONSTRUCTION: every negative case below is arranged so it can fail for exactly one
+-- reason. `priceIsRecent` also rejects future timestamps, so a naive `observationsTimestamp = now + 1`
+-- would make a case pass on staleness before it ever reaches the guard under test. Cases that must
+-- not trip monotonicity use a feed with no stored price; the staleness case uses a separate feed for
+-- the same reason (on a feed with a stored price, "older than maxStalenessSeconds" and "not newer
+-- than stored" are the same input).
+testPS15_recordVerifiedPrice : Script ()
+testPS15_recordVerifiedPrice = do
+  (operator, oraclePusher, o0) <- mkStore "ps15" 3600
+  n1 <- getTime
+  let raw   = "0003aaaabbbbccccddddeeeeffff"
+      other = "0003111122223333444455556666"
+      ts1   = epochSeconds n1
+      s     = toInterfaceContractId @VerifiedPriceSink
+      back  = fromInterfaceContractId @PriceStore
+
+  -- The hot key holds no operator authority, so it cannot reach this choice at all. Nothing is
+  -- stored yet and ts1 is now, so authority is the only possible failure.
+  submitMustFail oraclePusher $ exerciseCmd (s o0) RecordVerifiedPrice with
+    feedId = raw, price = 2500.0, observationsTimestamp = ts1
+
+  -- Happy path: the operator-authorised write lands and becomes active.
+  o1 <- back <$> submit operator (exerciseCmd (s o0) RecordVerifiedPrice with
+    feedId = raw, price = 2500.0, observationsTimestamp = ts1)
+  pd <- submit operator $ exerciseCmd o1 GetPrice with feedId = raw
+  assertEq "PS-15 price recorded" 2500.0 pd.price
+  assertEq "PS-15 raw feed id stored as the key" raw pd.feedId
+
+  -- A label key is refused. `resolvePrice` tries the direct key before the alias, so a write under
+  -- "ETH-USD" would permanently shadow the aliased verified feed.
+  -- Unstored key + current timestamp, so the V3 guard is the only reachable failure.
+  submitMustFail operator $ exerciseCmd (s o1) RecordVerifiedPrice with
+    feedId = "ETH-USD", price = 2500.0, observationsTimestamp = ts1
+  -- Same isolation for a non-V3 schema id.
+  submitMustFail operator $ exerciseCmd (s o1) RecordVerifiedPrice with
+    feedId = "0002aaaabbbbccccddddeeeeffff", price = 2500.0, observationsTimestamp = ts1
+
+  -- Positivity, isolated: advance so the timestamp is strictly newer than the stored one.
+  passSeconds 10
+  n2 <- getTime
+  let ts2 = epochSeconds n2
+  submitMustFail operator $ exerciseCmd (s o1) RecordVerifiedPrice with
+    feedId = raw, price = 0.0, observationsTimestamp = ts2
+  submitMustFail operator $ exerciseCmd (s o1) RecordVerifiedPrice with
+    feedId = raw, price = -3000.0, observationsTimestamp = ts2
+
+  -- Monotonicity, isolated: an older observation cannot overwrite a newer stored price even though
+  -- it is comfortably inside the staleness window. Equal is rejected too.
+  submitMustFail operator $ exerciseCmd (s o1) RecordVerifiedPrice with
+    feedId = raw, price = 9999.0, observationsTimestamp = ts1 - 1.0
+  submitMustFail operator $ exerciseCmd (s o1) RecordVerifiedPrice with
+    feedId = raw, price = 2500.0, observationsTimestamp = ts1
+
+  -- Staleness, isolated on a different feed (no stored price, so monotonicity cannot fire).
+  submitMustFail operator $ exerciseCmd (s o1) RecordVerifiedPrice with
+    feedId = other, price = 2500.0, observationsTimestamp = ts2 - 7200.0
+  -- And the future-timestamp rejection: a forged future report would otherwise compute a negative
+  -- age and always read as "recent".
+  submitMustFail operator $ exerciseCmd (s o1) RecordVerifiedPrice with
+    feedId = other, price = 2500.0, observationsTimestamp = ts2 + 7200.0
+  -- Control for both: an observation 3599s old on that feed is accepted.
+  _ <- submit operator $ exerciseCmd (s o1) RecordVerifiedPrice with
+    feedId = other, price = 2500.0, observationsTimestamp = ts2 - 3599.0
+  pure ()
+
+-- | PS-16: deviation confirmation works through RecordVerifiedPrice — a large move is held pending
+-- rather than activated, and is promoted only once a second report corroborates it.
+testPS16_recordVerifiedPriceHoldsLargeMoves : Script ()
+testPS16_recordVerifiedPriceHoldsLargeMoves = do
+  operator <- allocateParty "ps16-op"
+  oraclePusher <- allocateParty "ps16-pusher"
+  -- 10% deviation cap (1000 bps), so 2500 -> 5000 is a large move.
+  o0 <- submit operator $ createCmd PriceStore with
+    operator
+    oraclePusher
+    prices = TextMap.empty
+    pendingPrices = TextMap.empty
+    feedAliases = TextMap.empty
+    maxStalenessSeconds = 3600
+    lenientMaxStalenessSeconds = 86400
+    maxDeviationBps = 1000
+  passTime (days 1)
+  let raw = "0003aaaabbbbccccddddeeeeffff"
+
+  o1 <- record operator o0 raw 2500.0
+
+  -- A small move (+2%) activates immediately.
+  passSeconds 10
+  o2 <- record operator o1 raw 2550.0
+  small <- submit operator $ exerciseCmd o2 GetPrice with feedId = raw
+  assertEq "PS-16 small move activated at once" 2550.0 small.price
+
+  -- A doubling is not activated: it is held pending, so the old price is still served.
+  passSeconds 10
+  o3 <- record operator o2 raw 5000.0
+  held <- submit operator $ exerciseCmd o3 GetPrice with feedId = raw
+  assertEq "PS-16 large move held pending, old price still active" 2550.0 held.price
+  Some heldView <- queryContractId operator o3
+  assertEq "PS-16 the large move sits in pendingPrices"
+    (Some 5000.0) ((.price) <$> TextMap.lookup raw heldView.pendingPrices)
+
+  -- A second corroborating report promotes it (the pending must still be fresh, which 10s later
+  -- it is), and the pending entry is cleared.
+  passSeconds 10
+  o4 <- record operator o3 raw 5000.0
+  promoted <- submit operator $ exerciseCmd o4 GetPrice with feedId = raw
+  assertEq "PS-16 corroborated move promoted to active" 5000.0 promoted.price
+  Some promotedView <- queryContractId operator o4
+  assertMsg "PS-16 pending cleared on promotion" (TextMap.null promotedView.pendingPrices)
+
+-- PS-17: GetPriceWithStaleness applies the caller's (lenient) bound, not maxStalenessSeconds.
+testPS17_lenientRead : Script ()
+testPS17_lenientRead = do
+  (op, _, o1) <- mkStore "ps17" 3600
+  o2 <- record op o1 ethRaw 2500.0
+  passSeconds 7200                        -- stale for GetPrice, fresh for an 86400s bound
+  submitMustFail op $ exerciseCmd o2 GetPrice with feedId = ethRaw
+  pd <- submit op $ exerciseCmd o2 GetPriceWithStaleness with feedId = ethRaw, maxStaleness = 86400
+  assertEq "PS-17 lenient read accepts a price the strict read refuses" 2500.0 pd.price
+  -- Beyond the lenient bound it aborts too, and a missing feed aborts like GetPrice.
+  submitMustFail op $ exerciseCmd o2 GetPriceWithStaleness with feedId = ethRaw, maxStaleness = 3600
+  submitMustFail op $ exerciseCmd o2 GetPriceWithStaleness with feedId = btcRaw, maxStaleness = 86400
+
+-- PS-18: RegisterFeed rejects empty fields and is operator-only.
+testPS18_registerFeedInputsAndAuthority : Script ()
+testPS18_registerFeedInputsAndAuthority = do
+  (op, pusher, o0) <- mkStore "ps18" 3600
+  submitMustFail op $ exerciseCmd o0 RegisterFeed with label = "", rawFeedId = ethRaw
+  submitMustFail op $ exerciseCmd o0 RegisterFeed with label = "ETH-USD", rawFeedId = ""
+  -- The hot key cannot bind labels: that is trust config.
+  submitMustFail pusher $ exerciseCmd o0 RegisterFeed with label = "ETH-USD", rawFeedId = ethRaw
+  -- Control: the operator can.
+  _ <- submit op $ exerciseCmd o0 RegisterFeed with label = "ETH-USD", rawFeedId = ethRaw
+  pure ()
+
+-- PS-19: reads are operator-controlled. The pusher (an observer) and a third party cannot exercise
+-- GetPrice. This is a known limit, recorded in the README.
+testPS19_readsAreOperatorOnly : Script ()
+testPS19_readsAreOperatorOnly = do
+  (op, pusher, o1) <- mkStore "ps19" 3600
+  stranger <- allocateParty "ps19-stranger"
+  o2 <- record op o1 ethRaw 2500.0
+  submitMustFail pusher $ exerciseCmd o2 GetPrice with feedId = ethRaw
+  submitMustFail stranger $ exerciseCmd o2 GetPrice with feedId = ethRaw
+  _ <- submit op $ exerciseCmd o2 GetPrice with feedId = ethRaw
+  pure ()
+
+runPriceStoreTests : Script ()
+runPriceStoreTests = do
+  testPS01
+  testPS02
+  testPS03
+  testPS04
+  testPS05
+  testPS06
+  testPS07
+  testPS08
+  testPS09
+  testPS10
+  testPS11
+  testPS12_aliasIsAddOnly
+  testPS13_stalenessOrderingEnforced
+  testPS14_registerFeedRejectsNonV3RawId
+  testPS15_recordVerifiedPrice
+  testPS16_recordVerifiedPriceHoldsLargeMoves
+  testPS17_lenientRead
+  testPS18_registerFeedInputsAndAuthority
+  testPS19_readsAreOperatorOnly
+  debug "price store tests — all passed."

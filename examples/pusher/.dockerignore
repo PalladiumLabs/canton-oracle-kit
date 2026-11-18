@@ -1,0 +1,9 @@
+node_modules
+.env
+.env.*
+!.env.example
+.*.tmp
+pusher-state.json
+test
+scripts
+.git

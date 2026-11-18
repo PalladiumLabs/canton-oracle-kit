@@ -1,0 +1,73 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # Daml SDK version. Must match sdk-version in every daml.yaml.
+  SDK_VERSION: 3.4.11
+  # SHA-256 of https://get.digitalasset.com/install/install.sh as reviewed. If Digital Asset changes
+  # the installer, this step fails until the new script has been reviewed and the hash updated.
+  DPM_INSTALLER_SHA256: e5f20449dffefcf3b90f9b4941ce42d37832b300c6a6142b9a92b1cd5db9b139
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Repository lint (licence headers, placeholders, whitespace)
+        run: ./scripts/lint.sh
+
+  daml:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install DPM (pinned installer, pinned SDK)
+        run: |
+          curl -fsSL https://get.digitalasset.com/install/install.sh -o /tmp/dpm-install.sh
+          echo "${DPM_INSTALLER_SHA256}  /tmp/dpm-install.sh" | sha256sum --check --strict
+          sh /tmp/dpm-install.sh "${SDK_VERSION}"
+          echo "$HOME/.dpm/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch Chainlink Data Streams DARs (SHA-256 verified; not redistributed)
+        run: ./scripts/fetch-dars.sh
+
+      - name: Build all packages
+        run: dpm build --all
+
+      - name: Run Daml Script tests with coverage
+        working-directory: oracle-tests
+        run: |
+          # Without pipefail the step would take tee's exit status and pass on failing tests.
+          set -o pipefail
+          dpm test --show-coverage | tee /tmp/daml-test.txt
+          { echo '## Daml test coverage'; echo '```'; grep -iE 'coverage|templates|choices' /tmp/daml-test.txt || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run the local demo
+        working-directory: oracle-tests
+        run: dpm test --files src/Tests/Demo.daml
+
+      - name: Check package ids against CHANGELOG.md
+        run: ./scripts/check-package-ids.sh
+
+  pusher:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/pusher
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - run: npm ci --no-audit --no-fund
+      - run: npm run lint
+      - run: npm test
+      - name: Build the container image
+        run: docker build -t canton-oracle-pusher:ci .

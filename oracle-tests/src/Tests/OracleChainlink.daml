@@ -1,0 +1,625 @@
+-- Copyright 2026 Sats Labs Inc. (d/b/a Palladium Labs)
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Tests for the Chainlink ingestion package (`oracle-chainlink`), run against the real price
+-- store (`oracle-price-store`).
+--
+-- Contents:
+--   * OC-01/OC-02 — `RotateVerifier` validates the config and the verifier before adopting them.
+--   * OC-03 — `ValidateVerifier`, the operator diagnostic.
+--   * OC-04 — the trust property: a compromised hot key cannot forge prices.
+--   * OC-05 — revoking a leaked hot key: both rotations exist and are operator-only.
+--   * OC-06 — the real ingest path against a genuinely signed Chainlink report.
+--   * OC-07 — the decoder against the real ETH/USD feed id and a real market price.
+--   * OC-08 — signed (int192) prices decode as two's complement.
+--   * OC-09 — the report-window guards, each isolated against a policy-free test sink.
+module Tests.OracleChainlink where
+
+import Daml.Script
+import DA.Time (days, time)
+import DA.Date (date, Month(..))
+import PayloadBuilder (createPayloadFromIndices, encodePayload, getConfigDigest,
+                       getSignerAddresses)
+import Palladium.Oracle.Chainlink.ReportDataV3 (parseReportDataV3, ReportDataV3(..))
+import Palladium.Oracle.Chainlink.HexToDecimal (hexToSignedDecimal)
+import Palladium.Oracle.Chainlink.FeedId (isV3FeedId)
+import DA.Map qualified as GMap
+import DA.Crypto.Text (BytesHex)
+import DA.TextMap qualified as TextMap
+import Verifier (Verifier(..))
+import VerifierConfig (VerifierConfig(..))
+import Types.VerifierConfigState (VerifierConfigStateView(..), VerifierConfigDigest(..))
+import Interface.ConfirmedOwner (ConfirmedOwnerView(..))
+import Interface.Observable (ObservableView(..))
+import Interface.ManagedContract (ManagedContractView(..))
+import Palladium.Oracle.VerifiedPriceSink (VerifiedPriceSink, RecordVerifiedPrice(..))
+import Palladium.Oracle.PriceStore (PriceStore(..), epochSeconds)
+import Palladium.Oracle.PriceStore qualified as PS
+import Palladium.Oracle.Chainlink (ChainlinkPriceFeeder(..), RotateVerifier(..), ValidateVerifier(..),
+                                  PushVerifiedPrice(..), RotateOraclePusher(..))
+import Tests.RecordingSink (RecordingSink(..))
+
+-- | Local assertion helper, so this package depends on nothing but the packages under test and the
+-- Chainlink DARs.
+assertEq : (Eq a, Show a) => Text -> a -> a -> Script ()
+assertEq label expected actual =
+  assertMsg (label <> ": expected " <> show expected <> " but got " <> show actual)
+            (expected == actual)
+
+-- | A PriceStore with the intended role split (distinct operator / oraclePusher).
+-- maxDeviationBps is effectively unbounded so these tests never hit the deviation hold.
+mkOracle : Party -> Party -> Script (ContractId PriceStore)
+mkOracle operator oraclePusher =
+  submit operator $ createCmd PriceStore with
+    operator
+    oraclePusher
+    prices = TextMap.empty
+    pendingPrices = TextMap.empty
+    feedAliases = TextMap.empty
+    maxStalenessSeconds = 3600
+    lenientMaxStalenessSeconds = 86400
+    maxDeviationBps = 100000000
+
+-- | The interface view of a price store, which is what PushVerifiedPrice and RecordVerifiedPrice take.
+sink : ContractId PriceStore -> ContractId VerifiedPriceSink
+sink = toInterfaceContractId @VerifiedPriceSink
+
+-- | The concrete store behind an interface cid returned by a write.
+store : ContractId VerifiedPriceSink -> ContractId PriceStore
+store = fromInterfaceContractId @PriceStore
+
+mkVerifier : Party -> Script (ContractId Verifier)
+mkVerifier po = submit po $ createCmd Verifier with owner = po, observers = [po]
+
+-- | Build a VerifierConfig from a list of (key, digest) pairs.
+mkCfg : Party -> Party -> Text -> [(Text, VerifierConfigDigest)] -> Script (ContractId VerifierConfig)
+mkCfg po user uuid digests = submit po $ createCmd VerifierConfig with
+  confirmedOwnerView = ConfirmedOwnerView with owner = po, pendingOwner = None
+  observableView = ObservableView with observers = [user]
+  verifierConfigStateView = VerifierConfigStateView with verifierStates = GMap.fromList digests
+  managedContractView = ManagedContractView with uuid = uuid, user = user
+
+-- | Distinct signer keys. Content is irrelevant to validateVerifierPair, which only counts them.
+signerKeys : Int -> [(BytesHex, Int)]
+-- Note: the index range is bounded. Daml is strict, so `[0 ..]` diverges and takes the script
+-- service down with it rather than failing a test.
+signerKeys n = take n (zip ["aa","bb","cc","dd","ee","ff","11","22","33","44"] [0 .. 9])
+
+-- | `numSigners` matters: Verifier.Verify needs f + 1 unique signers from this map, so a digest with
+-- fewer can never verify. Pass it explicitly so no test can accidentally assert that an inert config
+-- is acceptable.
+mkDigest : Time -> Bool -> Int -> Int -> VerifierConfigDigest
+mkDigest t isActive f numSigners = VerifierConfigDigest with
+  latestConfigTime = t
+  isActive = isActive
+  f = f
+  oracles = GMap.fromList (signerKeys numSigners)
+
+--------------------------------------------------------------------------------
+-- OC-01 — RotateVerifier validates the config before adopting it
+--------------------------------------------------------------------------------
+
+-- Rotating the pinned pair swaps the root of trust for every price. A config whose only active
+-- digest has f = 0 verifies on a single signature, so one compromised DON signer could forge every
+-- price.
+testOC01_rotateValidatesConfig : Script ()
+testOC01_rotateValidatesConfig = do
+  po <- allocateParty "oc01-op"
+  pusher <- allocateParty "oc01-pusher"
+  user <- allocateParty "oc01-cfgUser"
+  t <- getTime
+  v <- mkVerifier po
+  goodCfg0 <- mkCfg po user "oc01-boot" [("boot", mkDigest t True 1 2)]
+  feeder <- submit po $ createCmd ChainlinkPriceFeeder with
+    operator = po, oraclePusher = pusher, verifierCid = v, verifierConfigCid = goodCfg0
+    expectedConfigOwner = po
+
+  -- (a) empty config rejected — nothing to verify against.
+  emptyCfg <- mkCfg po user "oc01-empty" []
+  submitMustFail po $ exerciseCmd feeder RotateVerifier with
+    newVerifierCid = v, newVerifierConfigCid = emptyCfg
+
+  -- (b) f = 0 rejected — one signature would suffice, so one compromised DON signer forges every
+  --     price.
+  weakCfg <- mkCfg po user "oc01-weak" [("aa", mkDigest t True 0 2)]
+  submitMustFail po $ exerciseCmd feeder RotateVerifier with
+    newVerifierCid = v, newVerifierConfigCid = weakCfg
+
+  -- (c) f >= 1 but inactive rejected — an inactive digest cannot verify anything.
+  inactiveCfg <- mkCfg po user "oc01-inactive" [("bb", mkDigest t False 2 3)]
+  submitMustFail po $ exerciseCmd feeder RotateVerifier with
+    newVerifierCid = v, newVerifierConfigCid = inactiveCfg
+
+  -- (d) An active digest with f >= 1 is accepted, and the pin actually lands.
+  goodCfg <- mkCfg po user "oc01-good" [("cc", mkDigest t True 1 2)]
+  rotated <- submit po $ exerciseCmd feeder RotateVerifier with
+    newVerifierCid = v, newVerifierConfigCid = goodCfg
+  Some f1 <- queryContractId po rotated
+  assertEq "OC-01 verifier pinned" v f1.verifierCid
+  assertEq "OC-01 config pinned" goodCfg f1.verifierConfigCid
+
+  -- (f) and (g) exercise `rotated`: (d) consumed `feeder`, so exercising it here would fail on an
+  --     archived contract and never reach the guard under test.
+  -- (f) A digest with f >= 1 but fewer than f + 1 signers is rejected. It passes every shape check
+  --     and is completely inert: Verify needs f + 1 unique signers from `oracles`, so pinning it is
+  --     the silent no-prices-at-all failure the validation exists to catch at the operator's own transaction.
+  inertCfg <- mkCfg po user "oc01-inert" [("ff", mkDigest t True 1 0)]
+  submitMustFail po $ exerciseCmd rotated RotateVerifier with
+    newVerifierCid = v, newVerifierConfigCid = inertCfg
+  underCfg <- mkCfg po user "oc01-under" [("gg", mkDigest t True 3 3)]   -- needs 4, has 3
+  submitMustFail po $ exerciseCmd rotated RotateVerifier with
+    newVerifierCid = v, newVerifierConfigCid = underCfg
+
+  -- (g) provenance: a config owned by someone other than the pinned expectedConfigOwner is rejected
+  --     even though its shape is perfect. Without this, one rotation to a self-minted config holding
+  --     the caller's own keys makes every self-signed report verify.
+  --     The operator is made an observer of the stranger's config (mkCfg's `user` argument): if it
+  --     could not see the config, the fetch would fail on visibility and this case would pass
+  --     without ever reaching the owner check.
+  stranger <- allocateParty "oc01-stranger"
+  strangerCfg <- mkCfg stranger po "oc01-stranger" [("hh", mkDigest t True 1 2)]
+  submitMustFail po $ exerciseCmd rotated RotateVerifier with
+    newVerifierCid = v, newVerifierConfigCid = strangerCfg
+
+  -- (e) A config carrying a mix is accepted as long as one active digest is usable.
+  --     Exercise on `rotated`: RotateVerifier is consuming, so (d) archived the original feeder.
+  mixedCfg <- mkCfg po user "oc01-mixed" [("dd", mkDigest t True 0 2), ("ee", mkDigest t True 3 4)]
+  _ <- submit po $ exerciseCmd rotated RotateVerifier with
+    newVerifierCid = v, newVerifierConfigCid = mixedCfg
+  pure ()
+
+--------------------------------------------------------------------------------
+-- OC-02 — RotateVerifier validates the verifier, not only the config
+--------------------------------------------------------------------------------
+
+-- A mistyped or archived verifier would otherwise be accepted — and with no manual-price fallback
+-- the store then produces no prices at all until someone re-pins.
+testOC02_rotateValidatesTheVerifierToo : Script ()
+testOC02_rotateValidatesTheVerifierToo = do
+  po <- allocateParty "oc02-op"
+  pusher <- allocateParty "oc02-pusher"
+  user <- allocateParty "oc02-user"
+  t <- getTime
+  goodVerifier <- mkVerifier po
+  -- Created and then archived — the realistic operator mistake of re-pinning a rotated-out contract.
+  deadVerifier <- mkVerifier po
+  submit po $ archiveCmd deadVerifier
+
+  goodCfg <- mkCfg po user "oc02-cfg" [("d1", mkDigest t True 1 2)]
+  feeder <- submit po $ createCmd ChainlinkPriceFeeder with
+    operator = po, oraclePusher = pusher, verifierCid = goodVerifier, verifierConfigCid = goodCfg
+    expectedConfigOwner = po
+
+  -- (a) An archived verifier is rejected, even though the config is perfectly valid.
+  submitMustFail po $ exerciseCmd feeder RotateVerifier with
+    newVerifierCid = deadVerifier, newVerifierConfigCid = goodCfg
+
+  -- (b) control: the same call with a live verifier and the same config succeeds, so the rejection
+  --     above is attributable to the verifier and not to the config or the fixture.
+  rotated <- submit po $ exerciseCmd feeder RotateVerifier with
+    newVerifierCid = goodVerifier, newVerifierConfigCid = goodCfg
+  Some f1 <- queryContractId po rotated
+  assertEq "OC-02 the live verifier was pinned" goodVerifier f1.verifierCid
+
+--------------------------------------------------------------------------------
+-- OC-03 — ValidateVerifier, the operator diagnostic
+--------------------------------------------------------------------------------
+
+-- `validateVerifierPair` performs Update actions, so it cannot be an `ensure` — which means a direct
+-- `create ChainlinkPriceFeeder` bypasses it. This diagnostic exists so the invariant is at least
+-- checkable after initial deployment.
+testOC03_validateVerifierDiagnostic : Script ()
+testOC03_validateVerifierDiagnostic = do
+  po <- allocateParty "oc03-op"
+  pusher <- allocateParty "oc03-pusher"
+  user <- allocateParty "oc03-user"
+  t <- getTime
+  v <- mkVerifier po
+
+  -- A feeder created directly with a weak config (f = 0) — the bypass RotateVerifier would refuse.
+  weakCfg <- mkCfg po user "oc03-weak" [("aa", mkDigest t True 0 2)]
+  bad <- submit po $ createCmd ChainlinkPriceFeeder with
+    operator = po, oraclePusher = pusher, verifierCid = v, verifierConfigCid = weakCfg
+    expectedConfigOwner = po
+  -- The diagnostic catches it. This is the whole reason the choice exists.
+  submitMustFail po $ exerciseCmd bad ValidateVerifier
+
+  -- A correctly configured feeder passes.
+  goodCfg <- mkCfg po user "oc03-good" [("cc", mkDigest t True 1 2)]
+  ok <- submit po $ createCmd ChainlinkPriceFeeder with
+    operator = po, oraclePusher = pusher, verifierCid = v, verifierConfigCid = goodCfg
+    expectedConfigOwner = po
+  submit po $ exerciseCmd ok ValidateVerifier
+
+  -- Operator-only: the hot key cannot run the diagnostic either.
+  submitMustFail pusher $ exerciseCmd ok ValidateVerifier
+
+--------------------------------------------------------------------------------
+-- OC-04 — the trust property: a compromised hot key cannot forge prices
+--------------------------------------------------------------------------------
+
+-- The pin lives on the feeder and the write is a separate choice in a separate package. Four
+-- independent facts establish the property:
+--
+--   (a) the hot key cannot write a price directly — no operator authority;
+--   (b) the hot key cannot install a feeder — ChainlinkPriceFeeder is signatory operator;
+--   (c) the hot key can drive the feeder, and the feeder verifies — a garbage report is rejected at
+--       Verify, so the pusher cannot fabricate a price through the legitimate path either;
+--   (d) the hot key cannot rotate the pin — RotateVerifier is operator-only, so it cannot swap
+--       in a rogue verifier that would accept its fabrications.
+--
+-- (a) and (c) together are the property. (b) and (d) are what stop the pusher from manufacturing a
+-- path that satisfies (a).
+testOC04_hotKeyCannotForgePrices : Script ()
+testOC04_hotKeyCannotForgePrices = do
+  po <- allocateParty "oc04-op"
+  pusher <- allocateParty "oc04-pusher"
+  user <- allocateParty "oc04-user"
+  -- Move off the epoch and derive the timestamp from the clock. Case (a) below must fail on
+  -- authority and nothing else; with a hard-coded `observationsTimestamp = 0.0` it would pass only
+  -- because the script sits at 1970-01-01, and any `passTime` added earlier would make it start
+  -- passing on the staleness guard instead. The positive control makes it self-checking.
+  passTime (days 1)
+  t <- getTime
+  v <- mkVerifier po
+  goodCfg <- mkCfg po user "oc04-cfg" [("d1", mkDigest t True 1 2)]
+  oracleCid <- mkOracle po pusher
+  feeder <- submit po $ createCmd ChainlinkPriceFeeder with
+    operator = po, oraclePusher = pusher, verifierCid = v, verifierConfigCid = goodCfg
+    expectedConfigOwner = po
+
+  -- (a) The hot key cannot write a price directly. RecordVerifiedPrice is controller operator,
+  --     and the pusher holds none of that authority.
+  let raw = "0003aaaabbbbccccddddeeeeffff"
+      ts  = epochSeconds t
+  submitMustFail pusher $ exerciseCmd (sink oracleCid) RecordVerifiedPrice with
+    feedId = raw, price = 999999.0, observationsTimestamp = ts
+  -- Positive control: the identical call from operator succeeds. This is what proves the refusal
+  -- above is about authority — if the arguments were stale, malformed or non-monotonic, this would
+  -- fail too and the test would tell us so.
+  _ <- submit po $ exerciseCmd (sink oracleCid) RecordVerifiedPrice with
+    feedId = raw, price = 999999.0, observationsTimestamp = ts
+
+  -- (b) The hot key cannot install its own feeder — a feeder is signatory operator, so a rogue
+  --     one naming a rogue verifier requires an operator-signed transaction. Without this, (a) would be bypassable.
+  rogueVerifier <- submit pusher $ createCmd Verifier with owner = pusher, observers = [pusher]
+  rogueCfg <- submit pusher $ createCmd VerifierConfig with
+    confirmedOwnerView = ConfirmedOwnerView with owner = pusher, pendingOwner = None
+    observableView = ObservableView with observers = [pusher]
+    verifierConfigStateView = VerifierConfigStateView with
+      verifierStates = GMap.fromList [("r", mkDigest t True 1 2)]
+    managedContractView = ManagedContractView with uuid = "oc04-rogue", user = pusher
+  submitMustFail pusher $ createCmd ChainlinkPriceFeeder with
+    operator = po, oraclePusher = pusher
+    verifierCid = rogueVerifier, verifierConfigCid = rogueCfg
+    expectedConfigOwner = po
+  -- not tested here, deliberately: a feeder naming the pusher itself as operator IS creatable
+  -- (the pusher is then its own signatory), and RecordVerifiedPrice on the real store would still
+  -- demand the real operator's authority. But that assertion is unreachable through
+  -- PushVerifiedPrice — Step 1's `Verify` rejects any report the pusher can produce long before Step
+  -- 4 is evaluated, so a `submitMustFail` here would pass on the malformed payload and prove nothing.
+  -- The property is covered directly by case (a) above, which calls RecordVerifiedPrice itself.
+
+  -- (c) The hot key can drive the real feeder — that is the intended path — but the report is
+  --     verified, so a fabricated one is rejected. The pusher therefore has no way to choose a price.
+  submitMultiMustFail [pusher] [po] $ exerciseCmd feeder PushVerifiedPrice with
+    sinkCid = sink oracleCid
+    signedReportBytes = "0003aaaabbbbccccddddeeeeffff"   -- not a signed report
+
+  -- (d) The hot key cannot rotate the pin, so it cannot swap in a verifier that would accept its
+  --     fabrications. This is the guard that keeps (c) meaningful over time.
+  submitMultiMustFail [pusher] [po] $ exerciseCmd feeder RotateVerifier with
+    newVerifierCid = rogueVerifier, newVerifierConfigCid = rogueCfg
+
+  -- Control: the operator can rotate, so the refusals above are about authority and not about the
+  -- fixture being unusable.
+  _ <- submit po $ exerciseCmd feeder RotateVerifier with
+    newVerifierCid = v, newVerifierConfigCid = goodCfg
+  pure ()
+
+--------------------------------------------------------------------------------
+-- OC-05 — revoking a leaked hot key: both rotations exist and are operator-only
+--------------------------------------------------------------------------------
+
+-- The store and the feeder each carry their own `oraclePusher`. Rotating only one leaves the old key
+-- live on the other, so full revocation means rotating both. This pins that both rotations exist,
+-- are operator-only, and that the store rotation preserves stored prices.
+testOC05_pusherRotationOnFeederAndStore : Script ()
+testOC05_pusherRotationOnFeederAndStore = do
+  po <- allocateParty "oc05-op"
+  oldPusher <- allocateParty "oc05-old"
+  newPusher <- allocateParty "oc05-new"
+  user <- allocateParty "oc05-user"
+  t <- getTime
+  v <- mkVerifier po
+  cfg <- mkCfg po user "oc05-cfg" [("d1", mkDigest t True 1 2)]
+  oracleCid <- mkOracle po oldPusher
+  feeder <- submit po $ createCmd ChainlinkPriceFeeder with
+    operator = po, oraclePusher = oldPusher, verifierCid = v, verifierConfigCid = cfg
+    expectedConfigOwner = po
+
+  -- The hot key cannot rotate itself out, and cannot rotate itself back in.
+  submitMustFail oldPusher $ exerciseCmd feeder RotateOraclePusher with newOraclePusher = newPusher
+  submitMustFail oldPusher $ exerciseCmd oracleCid PS.RotateOraclePusher with newOraclePusher = newPusher
+
+  -- The operator can rotate both contracts, and the store rotation preserves prices/aliases so it
+  -- is safe to run mid-incident.
+  o1 <- submit po $ exerciseCmd (sink oracleCid) RecordVerifiedPrice with
+    feedId = "0003aaaabbbbccccddddeeeeffff", price = 2500.0, observationsTimestamp = epochSeconds t
+  o2 <- submit po $ exerciseCmd (store o1) PS.RotateOraclePusher with newOraclePusher = newPusher
+  Some ov <- queryContractId po o2
+  assertEq "OC-05 store pusher rotated" newPusher ov.oraclePusher
+  assertMsg "OC-05 rotation preserved the stored price" (TextMap.size ov.prices == 1)
+
+  f2 <- submit po $ exerciseCmd feeder RotateOraclePusher with newOraclePusher = newPusher
+  Some fv <- queryContractId po f2
+  assertEq "OC-05 feeder pusher rotated" newPusher fv.oraclePusher
+  -- And the revoked key can no longer drive the rotated feeder at all.
+  submitMultiMustFail [oldPusher] [po] $ exerciseCmd f2 PushVerifiedPrice with
+    sinkCid = sink o2, signedReportBytes = "00"
+
+--------------------------------------------------------------------------------
+-- OC-06: the real ingest path, against a genuinely signed Chainlink report
+--------------------------------------------------------------------------------
+
+-- Every other test in this file builds `Verifier`/`VerifierConfig` with synthetic digests, so they
+-- prove authority and configuration shape and nothing about cryptography. This runs the deployed
+-- write path (PushVerifiedPrice -> Verify -> parseReportDataV3 -> RecordVerifiedPrice) end to end.
+-- An off-by-one in `extractWord`, a wrong scaling factor, or a broken hex decode would otherwise
+-- pass every test and write a nonsense price.
+--
+-- It uses Chainlink's own fixture (`PayloadBuilder`, shipped inside domain-1.0.0.dar) to build a
+-- payload carrying real ECDSA signatures, and a `VerifierConfig` holding the real signer addresses
+-- keyed by the real config digest. `Verify` therefore performs genuine signature recovery — nothing
+-- here is stubbed.
+--
+-- The fixture report, decoded (see the assertions below for why these exact numbers matter):
+--   feedId                0003 7da06d56d083fe599397a4769a042d63aa73dc4ef57709d31e9971a5b439
+--   validFromTimestamp    1760358626   2025-10-13 12:30:26 UTC
+--   observationsTimestamp 1760358686   2025-10-13 12:31:26 UTC
+--   expiresAt             1760358746   2025-10-13 12:32:26 UTC
+--   benchmarkPrice        3000000000000000000000  ->  / 1e18  =  3000.0
+--
+-- Note the report window is only 120 seconds wide and is an absolute instant in 2025, so the cases
+-- below are ordered by ledger time (not-yet-valid -> valid -> expired). Script time only moves
+-- forward, so this ordering is load-bearing.
+
+-- | The raw V3 feed id carried by the fixture report. Used as the storage key.
+fixtureFeedId : Text
+fixtureFeedId = "00037da06d56d083fe599397a4769a042d63aa73dc4ef57709d31e9971a5b439"
+
+-- | A `VerifierConfig` carrying the fixture's real signer set, keyed by its real config digest.
+-- `Verify` looks the digest up by `head reportContext`, so the key must be exactly this value or
+-- verification fails with `DigestNotSet` before any signature is checked.
+-- Note the pusher must be an observer: `Verifier.Verify` runs `fetch configCid` under the pusher's
+-- authority (it is `controller sender`, and PushVerifiedPrice passes `sender = oraclePusher`), so a
+-- config the pusher cannot read fails with a visibility error before any signature is checked. That
+-- is a real deployment requirement, not a test artefact.
+mkRealCfg : Party -> Party -> Party -> Int -> Script (ContractId VerifierConfig)
+mkRealCfg po user pusher f = do
+  t <- getTime
+  submit po $ createCmd VerifierConfig with
+    confirmedOwnerView = ConfirmedOwnerView with owner = po, pendingOwner = None
+    observableView = ObservableView with observers = [user, pusher]
+    verifierConfigStateView = VerifierConfigStateView with
+      verifierStates = GMap.fromList
+        [(getConfigDigest, VerifierConfigDigest with
+            latestConfigTime = t
+            isActive = True
+            f = f
+            -- The fixture ships 31 signers; `Verify` recovers each signature and matches it against
+            -- these keys. Bounded range deliberately: Daml is strict, so `[0 ..]` diverges.
+            oracles = GMap.fromList (zip getSignerAddresses [0 .. 30]))]
+    managedContractView = ManagedContractView with uuid = "oc06-cfg", user = user
+
+testOC06_realSignedReportEndToEnd : Script ()
+testOC06_realSignedReportEndToEnd = do
+  po     <- allocateParty "oc06-op"
+  pusher <- allocateParty "oc06-pusher"
+  user   <- allocateParty "oc06-user"
+
+  -- (a) not yet valid. Ledger time one minute before the report's validFromTimestamp.
+  --
+  -- Limitation: against the real store this case does not isolate the `validFromTimestamp` guard.
+  -- The store's `priceIsRecent` also refuses a future observation timestamp, and the fixture's
+  -- observationsTimestamp is validFrom + 60, so any instant before validFrom is also before the
+  -- observation. What this case proves is the operational property — a not-yet-valid report is
+  -- refused and no price is written. OC-09 isolates the feeder's guard against a policy-free sink.
+  setTime (time (date 2025 Oct 13) 12 29 26)
+  oracle0 <- mkOracle po pusher
+  verifier <- submit po $ createCmd Verifier with owner = po, observers = [po, pusher]
+  -- f = 2, so Verify requires exactly 3 signatures (f + 1).
+  cfg <- mkRealCfg po user pusher 2
+  feeder <- submit po $ createCmd ChainlinkPriceFeeder with
+    operator = po
+    oraclePusher = pusher
+    verifierCid = verifier
+    verifierConfigCid = cfg
+    expectedConfigOwner = po
+  let signedReport = encodePayload (createPayloadFromIndices [0, 1, 2])
+  submitMustFail pusher $ exerciseCmd feeder PushVerifiedPrice with
+    sinkCid = sink oracle0
+    signedReportBytes = signedReport
+
+  -- (b) the happy path. Ledger time inside the 120s window. This is the assertion that proves the
+  -- decoder: a wrong word index or a wrong scaling factor cannot produce exactly 3000.0.
+  setTime (time (date 2025 Oct 13) 12 31 56)
+  oracle1 <- store <$> submit pusher (exerciseCmd feeder PushVerifiedPrice with
+    sinkCid = sink oracle0
+    signedReportBytes = signedReport)
+  pd <- submit po $ exerciseCmd oracle1 PS.GetPrice with feedId = fixtureFeedId
+  assertEq "OC-06 benchmarkPrice decoded and scaled by 1e18" 3000.0 pd.price
+  assertEq "OC-06 stored under the RAW V3 feed id" fixtureFeedId pd.feedId
+  assertEq "OC-06 observationsTimestamp decoded from word 2" 1760358686.0 pd.observationsTimestamp
+
+  -- (c) wrong signature count. Same window, same genuine signatures, but only 2 of them while the
+  -- config says f = 2 (so Verify demands exactly 3). This is the real cryptographic negative:
+  -- it fails inside Verify, not in any of our own asserts.
+  let shortReport = encodePayload (createPayloadFromIndices [0, 1])
+  submitMustFail pusher $ exerciseCmd feeder PushVerifiedPrice with
+    sinkCid = sink oracle1
+    signedReportBytes = shortReport
+
+  -- (d) expired. Ledger time one minute past expiresAt.
+  -- Isolation matters here. Pushed at `oracle1` this case would pass vacuously: that store already
+  -- holds this exact report, so `isNewerThanActive` rejects it on monotonicity and the expiry guard
+  -- is never reached. Pushing at a fresh store removes that: nothing is stored so monotonicity
+  -- cannot fire, the observation is 120s old against maxStalenessSeconds = 3600 so staleness cannot
+  -- fire, and the signatures still verify. The expiry guard is then the only reachable failure.
+  setTime (time (date 2025 Oct 13) 12 33 26)
+  oracleFresh <- mkOracle po pusher
+  submitMustFail pusher $ exerciseCmd feeder PushVerifiedPrice with
+    sinkCid = sink oracleFresh
+    signedReportBytes = signedReport
+
+  -- The active price is still the one written in (b) — none of the three rejections mutated it.
+  pd2 <- submit po $ exerciseCmd oracle1 PS.GetPriceWithStaleness with
+    feedId = fixtureFeedId, maxStaleness = 86400
+  assertEq "OC-06 rejected pushes left the active price untouched" 3000.0 pd2.price
+
+--------------------------------------------------------------------------------
+-- OC-07: the decoder against the real ETH/USD feed id and a real market price
+--------------------------------------------------------------------------------
+
+-- OC-06 proves the cryptography, but on Chainlink's own fixture — whose feed id (00037da0…) is a
+-- test id and whose price is a synthetic round 3000.0. This decodes a V3 payload built with a real
+-- ETH/USD feed id and a real market price. It carries no signatures and does not go through
+-- `Verify` — signatures cannot be transplanted onto a different payload. What it isolates is the
+-- half OC-06 cannot: field positions and scaling, on a real feed id.
+--
+--   feedId          000362205e10…  ETH/USD-RefPrice-DS-Premium-Global-003
+--   benchmarkPrice  1918.69        (word 6)
+--   bid             1918.60        (word 7)
+--   ask             1918.78        (word 8)
+--
+-- The three prices are deliberately distinct. A V3 report carries 9 words; an off-by-one word index
+-- would silently return the bid or the ask instead of the benchmark. Here it cannot hide.
+
+-- | ETH/USD-RefPrice-DS-Premium-Global-003, with the `0x` stripped. Chainlink publishes these
+-- prefixed; `isV3FeedId` tests `take 4 == "0003"`, so the prefixed form is rejected.
+realEthUsdFeedId : Text
+realEthUsdFeedId = "000362205e10b3a147d02792eccee483dca6c7b44ecce7012cb8c6e0b68b3ae9"
+
+-- | 9 words: feedId, validFrom, observations, nativeFee, linkFee, expiresAt, benchmark, bid, ask.
+realEthUsdReport : BytesHex
+realEthUsdReport =
+  "000362205e10b3a147d02792eccee483dca6c7b44ecce7012cb8c6e0b68b3ae9" <>
+  "0000000000000000000000000000000000000000000000000000000068ecf0e2" <>
+  "0000000000000000000000000000000000000000000000000000000068ecf11e" <>
+  "00000000000000000000000000000000000000000000000000038d7ea4c68000" <>
+  "00000000000000000000000000000000000000000000000000005af3107a4000" <>
+  "0000000000000000000000000000000000000000000000000000000068ecf15a" <>
+  "000000000000000000000000000000000000000000000068032c35583e3d0000" <>
+  "00000000000000000000000000000000000000000000006801ec76d250740000" <>
+  "000000000000000000000000000000000000000000000068046bf3de2c060000"
+
+testOC07_realEthFeedDecodes : Script ()
+testOC07_realEthFeedDecodes = do
+  let report = parseReportDataV3 realEthUsdReport
+  -- The feed id survives decoding intact and passes the V3 prefix guard.
+  assertEq "OC-07 feed id decoded from word 0" realEthUsdFeedId report.feedId
+  assertMsg "OC-07 the real ETH/USD feed id passes isV3FeedId"
+            (isV3FeedId report.feedId)
+  -- The 0x-prefixed form Chainlink publishes is not accepted.
+  assertMsg "OC-07 the 0x-prefixed form is rejected" (not (isV3FeedId ("0x" <> realEthUsdFeedId)))
+  -- The assertion that matters: word 6, scaled by 1e18, is the benchmark and not the bid or the ask.
+  assertEq "OC-07 benchmarkPrice scaled by 1e18" 1918.69 (report.benchmarkPrice / 1.0e18)
+  -- Timestamps come from words 1, 2 and 5 — a shifted index would surface here too.
+  assertEq "OC-07 validFromTimestamp (word 1)"    1760358626.0 report.validFromTimestamp
+  assertEq "OC-07 observationsTimestamp (word 2)" 1760358686.0 report.observationsTimestamp
+  assertEq "OC-07 expiresAt (word 5)"             1760358746.0 report.expiresAt
+  -- Fees are decoded but unused; asserted so a future field reorder is caught here.
+  assertEq "OC-07 nativeFee (word 3)" 1000000000000000.0 report.nativeFee
+  assertEq "OC-07 linkFee (word 4)"    100000000000000.0 report.linkFee
+
+--------------------------------------------------------------------------------
+-- OC-08 — signed (int192) prices decode as two's complement, not as overflow
+--------------------------------------------------------------------------------
+
+-- See `hexToSignedDecimal`. benchmarkPrice/bid/ask are int192,
+-- sign-extended into a 256-bit word. A negative value is all-`f` in its high bytes; decoding it as
+-- unsigned parses a ~2^256 magnitude and trips the overflow guard with a misleading "too large"
+-- error. The store rejects the negative price either way (PS-15, "Price must be positive").
+--
+-- A V3 report identical to the ETH/USD fixture except word 6 (benchmarkPrice) holds -3000e18.
+negBenchmarkReport : BytesHex
+negBenchmarkReport =
+  "000362205e10b3a147d02792eccee483dca6c7b44ecce7012cb8c6e0b68b3ae9" <>
+  "0000000000000000000000000000000000000000000000000000000068ecf0e2" <>
+  "0000000000000000000000000000000000000000000000000000000068ecf11e" <>
+  "00000000000000000000000000000000000000000000000000038d7ea4c68000" <>
+  "00000000000000000000000000000000000000000000000000005af3107a4000" <>
+  "0000000000000000000000000000000000000000000000000000000068ecf15a" <>
+  "ffffffffffffffffffffffffffffffffffffffffffffff5d5ea2f6ae64200000" <>  -- word 6 = -3000e18
+  "00000000000000000000000000000000000000000000006801ec76d250740000" <>  -- word 7 = +1918.60e18
+  "000000000000000000000000000000000000000000000068046bf3de2c060000"      -- word 8 = +1918.78e18
+
+testOC08_signedPricesDecode : Script ()
+testOC08_signedPricesDecode = do
+  assertEq "OC-08 all-f word is -1"
+    (-1.0) (hexToSignedDecimal "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+  assertEq "OC-08 ...fe word is -2"
+    (-2.0) (hexToSignedDecimal "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe")
+  assertEq "OC-08 upper-case digits decode the same"
+    (-2.0) (hexToSignedDecimal "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFE")
+  assertEq "OC-08 top bit clear decodes as the unsigned value"
+    7.0 (hexToSignedDecimal "0000000000000000000000000000000000000000000000000000000000000007")
+
+  -- Through the full decoder: a negative benchmark decodes to the right negative price, while a
+  -- positive bid in the same report still decodes positive — so sign is per-field, not global.
+  let report = parseReportDataV3 negBenchmarkReport
+  assertEq "OC-08 negative benchmarkPrice scaled by 1e18" (-3000.0) (report.benchmarkPrice / 1.0e18)
+  assertEq "OC-08 positive bid in the same report" 1918.60 (report.bid / 1.0e18)
+
+--------------------------------------------------------------------------------
+-- OC-09 — the report-window guards, each isolated
+--------------------------------------------------------------------------------
+
+-- OC-06(a) cannot isolate `validFromTimestamp` against the real store (the store's future-timestamp
+-- guard fires first). Here the genuinely signed fixture is pushed at a test-only sink with no policy,
+-- so the feeder's own guards are the only possible failure: not-yet-valid fails, in-window passes,
+-- expired fails.
+testOC09_reportWindowIsolated : Script ()
+testOC09_reportWindowIsolated = do
+  po     <- allocateParty "oc09-op"
+  pusher <- allocateParty "oc09-pusher"
+  user   <- allocateParty "oc09-user"
+  setTime (time (date 2025 Oct 13) 12 29 26)                 -- one minute before validFrom
+  verifier <- submit po $ createCmd Verifier with owner = po, observers = [po, pusher]
+  cfg <- mkRealCfg po user pusher 2
+  feeder <- submit po $ createCmd ChainlinkPriceFeeder with
+    operator = po, oraclePusher = pusher, verifierCid = verifier, verifierConfigCid = cfg
+    expectedConfigOwner = po
+  rec0 <- submit po $ createCmd RecordingSink with operator = po, readers = [pusher], recorded = []
+  let signedReport = encodePayload (createPayloadFromIndices [0, 1, 2])
+      recSink = toInterfaceContractId @VerifiedPriceSink
+
+  -- (a) not yet valid — the feeder's validFromTimestamp guard is the only reachable failure.
+  submitMustFail pusher $ exerciseCmd feeder PushVerifiedPrice with
+    sinkCid = recSink rec0, signedReportBytes = signedReport
+
+  -- (b) IN window — passes, and the sink receives exactly the decoded, scaled values.
+  setTime (time (date 2025 Oct 13) 12 31 56)
+  rec1 <- submit pusher $ exerciseCmd feeder PushVerifiedPrice with
+    sinkCid = recSink rec0, signedReportBytes = signedReport
+  Some r <- queryContractId po (fromInterfaceContractId @RecordingSink rec1)
+  assertEq "OC-09 sink received (feedId, price, observationsTimestamp)"
+    [(fixtureFeedId, 3000.0, 1760358686.0)] r.recorded
+
+  -- (c) expired — the feeder's expiresAt guard is the only reachable failure.
+  setTime (time (date 2025 Oct 13) 12 33 26)
+  submitMustFail pusher $ exerciseCmd feeder PushVerifiedPrice with
+    sinkCid = rec1, signedReportBytes = signedReport
+
+runOracleChainlinkTests : Script ()
+runOracleChainlinkTests = do
+  testOC01_rotateValidatesConfig
+  testOC02_rotateValidatesTheVerifierToo
+  testOC03_validateVerifierDiagnostic
+  testOC04_hotKeyCannotForgePrices
+  testOC05_pusherRotationOnFeederAndStore
+  testOC06_realSignedReportEndToEnd
+  testOC07_realEthFeedDecodes
+  testOC08_signedPricesDecode
+  testOC09_reportWindowIsolated
+  debug "oracle-chainlink tests — all passed."

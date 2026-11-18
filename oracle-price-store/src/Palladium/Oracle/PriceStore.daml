@@ -1,0 +1,275 @@
+-- Copyright 2026 Sats Labs Inc. (d/b/a Palladium Labs)
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Price store — verified price feeds, one contract holding every feed.
+--
+-- Stores verified prices. Signature verification and V3 decoding live in a feeder (for Chainlink,
+-- the separate `oracle-chainlink` package), which calls `RecordVerifiedPrice` through the
+-- `VerifiedPriceSink` interface; this package carries no Chainlink dependency (see
+-- Palladium.Oracle.PriceStore.FeedId for why).
+module Palladium.Oracle.PriceStore where
+
+import DA.Time
+import DA.Date (date, Month(..))
+import DA.TextMap qualified as TextMap
+import Palladium.Oracle.PriceStore.FeedId (isV3FeedId)
+import Palladium.Oracle.VerifiedPriceSink
+
+-- | On-ledger price data for a single asset feed.
+data PriceData = PriceData
+  with
+    price : Decimal                -- already scaled to human units by the feeder
+    feedId : Text                  -- raw feed ID hex string (no 0x prefix)
+    observationsTimestamp : Decimal -- when oracle nodes observed the price (Unix seconds)
+    updatedAt : Time               -- when stored on the ledger
+  deriving (Eq, Show)
+
+-- | Current ledger time as Unix epoch seconds.
+epochSeconds : Time -> Decimal
+epochSeconds t =
+  intToDecimal (convertRelTimeToMicroseconds (subTime t (time (date 1970 Jan 1) 0 0 0))) / 1000000.0
+
+-- | Check if a price report's observation time is recent enough.
+-- Also rejects future timestamps (age < 0) — a forged future report would
+-- otherwise compute a negative age and always read as "recent".
+priceIsRecent : Decimal -> Time -> Int -> Bool
+priceIsRecent observationsTimestamp currentTime maxStalenessSeconds =
+  let age = epochSeconds currentTime - observationsTimestamp
+  in age >= 0.0 && age <= intToDecimal maxStalenessSeconds
+
+-- | True if newP is within maxDeviationBps (basis points) of oldP. Deviation guard.
+withinDeviation : Decimal -> Decimal -> Int -> Bool
+withinDeviation oldP newP maxDeviationBps =
+  if oldP <= 0.0 then True
+  else (abs (newP - oldP) / oldP) * 10000.0 <= intToDecimal maxDeviationBps
+
+-- | Check staleness using a stored PriceData record.
+priceDataIsRecent : PriceData -> Time -> Int -> Bool
+priceDataIsRecent pd currentTime maxStalenessSeconds =
+  priceIsRecent pd.observationsTimestamp currentTime maxStalenessSeconds
+
+-- | Resolve a feed key — try it directly, then via the registered label->rawFeedId alias.
+-- Shared by GetPrice and GetPriceWithStaleness so the resolution can't drift between them.
+resolvePrice : TextMap.TextMap PriceData -> TextMap.TextMap Text -> Text -> Optional PriceData
+resolvePrice prices feedAliases feedId =
+  case TextMap.lookup feedId prices of
+    Some pd -> Some pd
+    None -> case TextMap.lookup feedId feedAliases of
+      Some rawFeedId -> TextMap.lookup rawFeedId prices
+      None -> None
+
+-- | Observation-timestamp monotonicity. An incoming report must be strictly newer than the
+-- stored active price for the feed (or there is none yet), so an older still-recent report can't roll
+-- the price/timestamp backward. The deviation guard does not catch this.
+isNewerThanActive : Optional PriceData -> Decimal -> Bool
+isNewerThanActive activeOpt newObsTimestamp =
+  case activeOpt of
+    None -> True
+    Some active -> newObsTimestamp > active.observationsTimestamp
+
+-- | Outcome of the deviation guard for an incoming price.
+data PriceUpdateAction = Activate | HoldPending
+  deriving (Eq, Show)
+
+-- | Decide whether an incoming price activates now or is held pending. A small move
+-- (within maxDeviationBps of the active price) activates immediately. A large move activates only
+-- if a *fresh* pending value corroborates it — `priceDataIsRecent pend` gives the pending value a
+-- TTL, so a stale pending cannot rubber-stamp a large move (it is held as a fresh pending instead,
+-- still needing a genuinely fresh second report). note: the confirmation delay itself (old price
+-- served while a large move is pending) is the inherent circuit-breaker trade-off and is
+-- intentionally retained — see the README section "The deviation hold and its trade-off".
+decidePriceUpdate : Optional PriceData -> Optional PriceData -> Decimal -> Int -> Time -> Int -> PriceUpdateAction
+decidePriceUpdate activeOpt pendOpt newPrice maxDeviationBps now maxStalenessSeconds =
+  case activeOpt of
+    None -> Activate                                   -- first price for this feed
+    Some active ->
+      if withinDeviation active.price newPrice maxDeviationBps
+        then Activate                                  -- small move: activate immediately
+        else case pendOpt of
+          Some pend ->
+            if priceDataIsRecent pend now maxStalenessSeconds   -- pending must be fresh
+                 && withinDeviation pend.price newPrice maxDeviationBps
+              then Activate                            -- corroborated by a fresh pending report
+              else HoldPending                         -- stale pending or no corroboration: hold anew
+          None -> HoldPending
+
+-- | Single PriceStore contract storing verified prices for all supported asset feeds.
+-- Stores a map of feedId -> PriceData.
+template PriceStore
+  with
+    operator : Party
+    oraclePusher : Party                 -- hot price key, holds no funds. Observer here (it must
+                                         -- see the store); it writes prices only via a feeder,
+                                         -- never directly.
+    prices : TextMap.TextMap PriceData   -- feedId -> PriceData (active prices)
+    pendingPrices : TextMap.TextMap PriceData  -- large moves awaiting a second corroborating report
+    feedAliases : TextMap.TextMap Text   -- canonical label (e.g. "ETH-USD") -> raw report.feedId
+    maxStalenessSeconds : Int            -- strict bound in seconds, used by GetPrice
+    lenientMaxStalenessSeconds : Int     -- looser bound for callers that must not be blocked by one
+                                         -- stale unrelated feed; read via GetPriceWithStaleness
+    maxDeviationBps : Int                -- max single-update move (bps) before a price needs confirmation; e.g. 1000 = 10%
+  where
+    signatory operator
+    observer oraclePusher
+    -- The two staleness bounds have NO other validation — plain Int fields, and no choice that
+    -- updates them, so they are fixed at creation and a deployment-time mistake is permanent and
+    -- silent. The lenient bound exists to be the more permissive one. Deploying them inverted gives
+    -- the worst possible arrangement: a price fresh enough for the strict path is not fresh enough
+    -- for the lenient one. A template ensure is the right place: it fires on every create,
+    -- including the initial deployment, which is the only place this can be got wrong.
+    ensure maxStalenessSeconds > 0
+        && lenientMaxStalenessSeconds >= maxStalenessSeconds
+        && maxDeviationBps > 0
+
+    -- | Record an already-verified price. This is the price-write primitive; the Chainlink-specific
+    -- ingestion (signature verification, V3 decoding, report-window checks) lives in the separate
+    -- `oracle-chainlink` package so that this package carries no Chainlink dependency.
+    --
+    -- IT does not verify anything. The name says "verified" because that is the caller's contract,
+    -- not this choice's guarantee. `controller operator` means any contract signed by
+    -- operator can reach it, so the security property is delegated, not enforced here:
+    --   * the hot `oraclePusher` key holds NO operator authority, so it cannot call this at all;
+    --   * the intended caller is `ChainlinkPriceFeeder.PushVerifiedPrice`, which IS signed by
+    --     operator and whose body runs `Verifier.Verify` against an operator-pinned verifier
+    --     before calling this;
+    --   * an operator ceremony can call this directly, bypassing Chainlink. That is not a new
+    --     capability: `PriceStore` is `signatory operator` alone, so an operator-signed transaction can already
+    --     archive it and recreate it with arbitrary prices. The control for that is off-ledger:
+    --     every change to `prices` must appear in the transaction tree as a child of a
+    --     `PushVerifiedPrice` exercise, and one that is not is an incident. See SECURITY.md.
+    --
+    -- Kept on this side of the boundary because every check below needs store state
+    -- (`maxStalenessSeconds`, `prices`, `pendingPrices`, `maxDeviationBps`). The two checks that need
+    -- only the report — `validFromTimestamp` and `expiresAt` — live in the feeder, because they
+    -- cannot be expressed from these arguments and putting them here would mean carrying report
+    -- fields the store has no other use for.
+    interface instance VerifiedPriceSink for PriceStore where
+      view = VerifiedPriceSinkView with operator
+      recordVerifiedPrice feedId price observationsTimestamp = do
+        -- Constrain the verified path to raw V3 ids. This is a real guard, not tidiness:
+        -- `resolvePrice` tries the direct key before the alias, so a write under a label key (e.g.
+        -- "ETH-USD") would permanently shadow the aliased verified feed. Restricting this choice to
+        -- "0003…" ids makes that shadow unreachable from the feeder.
+        assertMsg ("RecordVerifiedPrice expects a raw V3 Chainlink feed id (prefix 0003), got: " <> feedId)
+                  (isV3FeedId feedId)
+        assertMsg "Price must be positive" (price > 0.0)
+        currentTime <- getTime
+        assertMsg "Price report is stale"
+          (priceIsRecent observationsTimestamp currentTime maxStalenessSeconds)
+        -- Observation-timestamp monotonicity, guarding both the accept and pending paths,
+        -- so an older still-recent report cannot overwrite a newer stored price.
+        assertMsg "Report is not newer than the stored price (observation timestamp must increase)"
+          (isNewerThanActive (TextMap.lookup feedId prices) observationsTimestamp)
+
+        let pd = PriceData with
+              price = price
+              feedId = feedId
+              observationsTimestamp = observationsTimestamp
+              updatedAt = currentTime
+
+        -- Deviation confirmation: a small move is accepted at once; a large move is held pending and
+        -- promoted only when a second report corroborates it, and that corroborating pending must
+        -- still be fresh.
+        let accept = create this with
+              prices = TextMap.insert feedId pd prices
+              pendingPrices = TextMap.delete feedId pendingPrices
+            holdPending = create this with
+              pendingPrices = TextMap.insert feedId pd pendingPrices
+        newCid <- case decidePriceUpdate (TextMap.lookup feedId prices) (TextMap.lookup feedId pendingPrices)
+                               price maxDeviationBps currentTime maxStalenessSeconds of
+          Activate -> accept
+          HoldPending -> holdPending
+        pure (toInterfaceContractId @VerifiedPriceSink newCid)
+
+    -- | Rotate the hot pusher key on the store. operator only.
+    --
+    -- Without this, revoking a leaked `oraclePusher` is impossible without recreating the store and
+    -- losing every price and alias. Rotate the feeder and the store together; see SECURITY.md.
+    -- Changes no price and no alias, so it is safe to run mid-incident.
+    choice RotateOraclePusher : ContractId PriceStore
+      with
+        newOraclePusher : Party
+      controller operator
+      do create this with oraclePusher = newOraclePusher
+
+    -- | Read a price for a specific feed. Validates staleness.
+    -- A consumer may read with a human label (e.g. "ETH-USD"), but the verified path
+    -- (RecordVerifiedPrice) stores under the raw report.feedId. So look up the key directly first;
+    -- on a miss, fall back through the registered alias (label -> raw feed id) and try the resolved
+    -- key. Still aborts loudly if neither yields a price, so a misconfiguration surfaces on first read.
+    nonconsuming choice GetPrice : PriceData
+      with
+        feedId : Text
+      controller operator
+      do
+        case resolvePrice prices feedAliases feedId of
+          None ->
+            let availableFeeds = map fst (TextMap.toList prices)
+            in abort ("No price for feed: '" <> feedId <> "' (direct key and registered alias both missing). Available feeds: " <> show availableFeeds)
+          Some pd -> do
+            currentTime <- getTime
+            assertMsg "Stored price is stale"
+              (priceDataIsRecent pd currentTime maxStalenessSeconds)
+            pure pd
+
+    -- | Read a price checked against an explicit (looser) staleness bound, for callers that must not
+    -- be blocked by one stale, unrelated feed. Strict callers keep using GetPrice
+    -- (`maxStalenessSeconds`). Same resolution + abort-on-missing as GetPrice.
+    -- The bound is the caller's argument; `lenientMaxStalenessSeconds` is the value the operator
+    -- configured for callers to pass.
+    nonconsuming choice GetPriceWithStaleness : PriceData
+      with
+        feedId : Text
+        maxStaleness : Int
+      controller operator
+      do
+        case resolvePrice prices feedAliases feedId of
+          None ->
+            let availableFeeds = map fst (TextMap.toList prices)
+            in abort ("No price for feed: '" <> feedId <> "' (direct key and registered alias both missing). Available feeds: " <> show availableFeeds)
+          Some pd -> do
+            currentTime <- getTime
+            assertMsg "Stored price is stale (beyond lenient tolerance)"
+              (priceDataIsRecent pd currentTime maxStaleness)
+            pure pd
+
+    -- | Register a canonical-label -> raw-feed-id alias so a consumer reading with a human label can
+    -- read a price that RecordVerifiedPrice stored under the raw 32-byte report.feedId. This is trust
+    -- config (binds a label to a verified feed id), so it is controlled by operator (config
+    -- authority), not the hot oraclePusher key.
+    choice RegisterFeed : ContractId PriceStore
+      with
+        label : Text       -- the key consumers read by
+        rawFeedId : Text   -- the report.feedId that RecordVerifiedPrice stores under
+      controller operator
+      do
+        assertMsg "Feed label must not be empty" (label /= "")
+        assertMsg "Raw feed id must not be empty" (rawFeedId /= "")
+        -- The raw id must be a V3 Chainlink Data Streams feed id. The verified path already rejects
+        -- non-V3 ids on both sides of the package boundary (in the feeder's decoder, and in
+        -- RecordVerifiedPrice's raw-id guard), so an alias pointing at a non-V3 raw id can never
+        -- receive a price — and a consumer bound to that label would be permanently unpriceable,
+        -- with no error until someone tries to use it. Checking the format here only moves that
+        -- failure forward to registration, where it is one aborted operator transaction instead.
+        assertMsg ("Raw feed id is not a V3 Chainlink Data Streams id (prefix must be 0003): " <> rawFeedId)
+                  (isV3FeedId rawFeedId)
+        -- Registering is add-only. A plain TextMap.insert would silently re-point a live label at a
+        -- different raw feed: a consumer reads through this alias, so re-aliasing "ETH-USD" to BTC's
+        -- raw id would value everything priced in ETH at BTC's price, while the consumer's own
+        -- configured label never changes.
+        -- Re-registering the same mapping stays allowed so a retry / re-run is idempotent.
+        -- No re-pointing path is provided on purpose: the escape hatch IS the vulnerability. If a
+        -- Chainlink feed id is ever genuinely rotated for the same asset, add an explicit
+        -- RetargetFeedAlias choice then — and gate it on the new feed already having a fresh price
+        -- within `withinDeviation` of the current one. That distinguishes the two cases by itself:
+        -- a real rotation prices the same asset (tiny move), a malicious re-point prices a
+        -- different one (huge move).
+        case TextMap.lookup label feedAliases of
+          Some existing ->
+            assertMsg ("Feed label '" <> label <> "' is already registered to raw feed '" <>
+                       existing <> "' — re-pointing a live label would revalue every consumer " <>
+                       "of that label at another asset's price")
+                      (existing == rawFeedId)
+          None -> pure ()
+        create this with
+          feedAliases = TextMap.insert label rawFeedId feedAliases

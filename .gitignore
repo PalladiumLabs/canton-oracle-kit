@@ -1,0 +1,10 @@
+# Daml build output
+.daml/
+*.dar
+
+# Chainlink Data Streams contracts are NOT redistributed here. Fetch them from the official
+# release (see README) into this directory.
+/data-streams-dars/
+
+# macOS
+.DS_Store

@@ -1,0 +1,58 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write       # create the GitHub release
+  id-token: write       # build provenance attestation
+  attestations: write
+
+env:
+  SDK_VERSION: 3.4.11
+  DPM_INSTALLER_SHA256: e5f20449dffefcf3b90f9b4941ce42d37832b300c6a6142b9a92b1cd5db9b139
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install DPM (pinned installer, pinned SDK)
+        run: |
+          curl -fsSL https://get.digitalasset.com/install/install.sh -o /tmp/dpm-install.sh
+          echo "${DPM_INSTALLER_SHA256}  /tmp/dpm-install.sh" | sha256sum --check --strict
+          sh /tmp/dpm-install.sh "${SDK_VERSION}"
+          echo "$HOME/.dpm/bin" >> "$GITHUB_PATH"
+
+      - name: Build and test
+        run: |
+          ./scripts/fetch-dars.sh
+          dpm build --all
+          ./scripts/check-package-ids.sh
+          (cd oracle-tests && dpm test)
+
+      - name: Collect DARs and checksums
+        run: |
+          mkdir -p dist
+          for p in oracle-api oracle-price-store oracle-chainlink; do
+            cp "$p"/.daml/dist/*.dar dist/
+          done
+          (cd dist && sha256sum *.dar > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Attest build provenance
+        # Attestations need a public repository; skip while private so a release can still be cut.
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: dist/*.dar
+
+      - name: Create the GitHub release
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+        with:
+          files: |
+            dist/*.dar
+            dist/SHA256SUMS
+          generate_release_notes: true

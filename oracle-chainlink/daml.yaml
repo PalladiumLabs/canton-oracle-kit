@@ -1,0 +1,26 @@
+name: oracle-chainlink
+version: 1.0.0
+sdk-version: 3.4.11
+
+source: src
+dependencies:
+  - daml-prim
+  - daml-stdlib
+
+# Chainlink Data Streams Canton contracts, version 1.0.0 (MIT-licensed, see THIRD_PARTY_NOTICES.md).
+# These are NOT redistributed in this repository; ./scripts/fetch-dars.sh downloads them from the
+# official release into ../data-streams-dars/. Daml data-dependencies are not transitive, so every
+# package whose types this one references must be listed explicitly.
+#
+# These four DARs are the reason this package is separate from oracle-price-store: a participant
+# that only needs to read or be informed about prices never has to vet Chainlink code.
+data-dependencies:
+  - ../oracle-api/.daml/dist/oracle-api-1.0.0.dar
+  - ../data-streams-dars/verifier-1.0.0.dar
+  - ../data-streams-dars/verifier-config-1.0.0.dar
+  - ../data-streams-dars/domain-1.0.0.dar
+  - ../data-streams-dars/common-1.0.0.dar
+
+build-options:
+  # The decoder works on hex text; silence the crypto-text alpha warning for the whole package.
+  - -Wno-crypto-text-is-alpha
